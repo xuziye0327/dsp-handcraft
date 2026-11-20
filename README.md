@@ -13,16 +13,19 @@ Pick a product and a rate per minute, and get a complete production-line bluepri
 - Choose belts, sorters, smelters, assemblers, labs, proliferator, power (Tesla Towers or Satellite Substations) and logistics (belts in and out, storage, or Interstellar Logistics Stations).
 - Every blueprint is checked independently before you copy it: collisions, belt connections, sorter reach, power coverage.
 - Also generates fractionator arrays for deuterium.
+- Game mechanics we tested in the game and read from its code: **https://dspbp.com/en/tips/** (belt throughput and stacking, real Pile Sorter speeds, collision boxes, how latitude affects blueprints and more), each with its source.
 
 English is new in 3.3. If a name or sentence reads wrong, or a blueprint does not paste cleanly, please [open an issue](https://github.com/zoujack018/dsp-handcraft/issues).
 
 ## 中文
 
-选好目标产物和每分钟产量，自动排出产线蓝图，复制后贴进游戏。按玩家手搓的风格排：每种物品走自己的带，工厂分行、行间夹传送带通道，分拣器都紧挨着。当前版本 3.3.4（2026/11/13）。
+选好目标产物和每分钟产量，自动排出产线蓝图，复制后贴进游戏。按玩家手搓的风格排：每种物品走自己的带，工厂分行、行间夹传送带通道，分拣器都紧挨着。当前版本 3.3.5（2026/11/20）。
 
 **直接用：https://dspbp.com/** 打不开时点右上角绿色的 Code → Download ZIP，解压后双击 `index.html`，不用联网、不用安装。
 
 **量产计算器：https://dspbp.com/calc/** 选目标和每分钟产量，算出每种设备要几台、要多少原料，点「生成蓝图」把整条线带进生成器排，也能出无带流蓝图（下载的那份是 `calc/index.html`）。配方数据和界面来自[戴森球计划量产量化计算器（DSQ）](https://github.com/122474363/DSQ)。
+
+**游戏机制实测：https://dspbp.com/tips/** 传送带运力和叠层、集装分拣器各级实际速度、建筑碰撞框、纬度对蓝图的影响等，做生成器时在游戏里实测和读游戏代码得出的，每条注明出处。
 
 也嵌在[戴森球计划量产量化计算器](https://dsq.svlik.com/)里：在计算器里点「生成蓝图」打开。
 
@@ -30,6 +33,7 @@ English is new in 3.3. If a name or sentence reads wrong, or a blueprint does no
 
 ## 3.3 更新
 
+- 3.3.5：多了一页[游戏机制实测](https://dspbp.com/tips/)（26 条，英文 dspbp.com/en/tips/）；量产计算器里硅石选「石矿炼」时生成器照做（以前报错）。
 - 3.3.4：没生成之前图纸上多了三步说明；页面底下加了一段简介和常见问题（生成的蓝图怎么贴进游戏、能排哪些产线等）。
 - 3.3.3：中文入口（dspbp.com、dspbp.com/calc/）固定显示中文，英文浏览器打开时页面底下有一条去英文入口的提示；网页标题带上「戴森球计划」。
 - 3.3.2：站点带上量产计算器（dspbp.com/calc/，英文 dspbp.com/en/calc/），从计算器点「生成蓝图」接着排；英文模式下蓝图自带的名字和说明也是英文。
