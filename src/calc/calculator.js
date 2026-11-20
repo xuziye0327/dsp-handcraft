@@ -37,14 +37,16 @@ const EPS = 1e-9;
 export function calculate({ target, rate, targets, smelter = 2302, assembler = 2303, chemical = 2309, lab = 2901, labStack = 15, recipes = {}, raw = [], spray = 0, sprayFor = null, latitude = 'high', supply = null, storeSorter = 2013, storeLayers = 15, storeBelt = 3 }) {
   const goals = (targets?.length ? targets : [{ target, rate }]).map((t) => ({ item: item(t.target), rate: Number(t.rate) }));
   const targetItem = goals[0].item;
-  const rawIds = new Set([...RAW_ITEM_IDS, ...raw.map((n) => item(n).id)]);
+  const extIds = new Set(raw.map((n) => item(n).id));
   const overrides = new Map(Object.entries(recipes || {}).filter(([, v]) => v != null && v !== '').map(([k, v]) => [item(idOrName(k)).id, recipeOf(idOrName(v))]));
 
   const chooseRecipe = (itemId) => {
-    if (rawIds.has(itemId)) return null;
+    if (extIds.has(itemId)) return null;
     // 选的配方原料里有它自己（精炼油的重整精炼，计算器带过来的也算）：不用，照默认（见 gamedata.js 的 defaultRecipe）
     const o = overrides.get(itemId);
-    if (o && !o.inputs.some((x) => x.id === itemId)) return o;
+    // 原矿也能指定配方做（硅石用石矿炼，量产计算器里选了会带过来）；不指定就是开采，从外面来
+    if (o && o.inputs.length && !o.inputs.some((x) => x.id === itemId)) return o;
+    if (RAW_ITEM_IDS.has(itemId)) return null;
     return defaultRecipe(itemId); // 优先单产物配方；只有带副产物的配方能做时（反物质、精炼油），副产物单独送出
   };
   const chooseFactory = (r) => {
@@ -160,6 +162,12 @@ export function calculate({ target, rate, targets, smelter = 2302, assembler = 2
       if (fed) sprayFlow += inRate;
       flows.push({ itemId: inp.id, from: null, to: unit.id, rate: inRate });
     }
+  }
+  // 目标都是原矿、设成了外部供应或没有配方（黑雾掉落这类）：一台工厂都没有，排不出东西
+  if (!units.length) {
+    const id = goals[0].item.id;
+    const why = extIds.has(id) ? '设成了外部供应' : RAW_ITEM_IDS.has(id) ? '是原矿，直接开采' : '没有能在产线里做的配方';
+    throw new Error(`「${goals.map((g) => g.item.name).join('、')}」${why}，产线里没有要排的工厂。`);
   }
   // 回填每条流的来源：生产该物品的配方组，或 'RAW'
   const producerOf = new Map(units.flatMap((u) => [[u.itemId, u.id], ...(u.shared ?? []).map((id) => [id, u.id])]));

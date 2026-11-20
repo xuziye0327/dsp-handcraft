@@ -3,13 +3,13 @@
 // 量产计算器在 calc/：web/calc 里的原样抄过去（make-icons.py 除外），另加英文模式用的 calc-en.js（web/src/i18n/calc.js 打包）；
 // 计算器点「生成蓝图」在弹层里开同语言的生成器，生成器开头引入 calc/bridge.js（最上面「返回计算器」、排好了告诉计算器）。
 // 网站（GitHub Pages 放本仓库）中文、英文各一套入口：生成器 index.html 和 en/index.html，计算器 calc/index.html 和 en/calc/index.html；
-// 头上的标签、根目录的 sitemap.xml、robots.txt 见 web/site.js。
+// 游戏机制实测一页 tips/index.html 和 en/tips/index.html（静态文字）。头上的标签、根目录的 sitemap.xml、robots.txt 见 web/site.js。
 // --embed <路径>：另出一份嵌进别的网站用的（开头引入同目录的 bridge.js，由它给图标；见 web/src/handoff.js）。
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as esbuild from 'esbuild';
-import { sitePage, calcPage, sitemap, robots } from './site.js';
+import { sitePage, calcPage, tipsPage, sitemap, robots } from './site.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const bundle = async (entry) => {
@@ -55,6 +55,11 @@ for (const [lang, file] of [['zh', 'calc/index.html'], ['en', 'en/calc/index.htm
   fs.writeFileSync(path.join(root, file), html);
 }
 console.log(`已生成计算器 calc/index.html、en/calc/index.html，${calcFiles.length + 1} 个文件放进 calc/（英文模式 calc-en.js ${(calcEn.length / 1024).toFixed(0)} KB）`);
+for (const [lang, file] of [['zh', 'tips/index.html'], ['en', 'en/tips/index.html']]) {
+  fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+  fs.writeFileSync(path.join(root, file), tipsPage(lang));
+}
+console.log('已生成游戏机制实测 tips/index.html、en/tips/index.html');
 fs.writeFileSync(path.join(root, 'sitemap.xml'), sitemap());
 fs.writeFileSync(path.join(root, 'robots.txt'), robots());
 const args = process.argv.slice(2);

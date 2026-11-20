@@ -50,6 +50,13 @@ export default {
   '未知配方 ID {0}': 'Unknown recipe ID {0}',
   '未知配方「{0}」': 'Unknown recipe "{0}"',
   '未知工厂 ID {0}': 'Unknown factory ID {0}',
+  // 目标是原矿（或设成了外部供应、没有配方）时一台工厂都没有
+  '「{0}」{1}，产线里没有要排的工厂。': '"{0}" {1}, so there are no factories to lay out.',
+  '是原矿，直接开采': 'is a raw ore, mined directly',
+  '设成了外部供应': 'is set as external supply',
+  '没有能在产线里做的配方': 'has no recipe the line can make',
+  // 原矿的默认来源（「新配方」里硅石那张的默认）
+  '开采': 'Mined',
 };
 
 // 只在页面某一块里才这么翻的（[选择器, 词典]）：顶上一排按钮写短名，图纸标题栏的统计是复数

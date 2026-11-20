@@ -26,8 +26,15 @@ import { dsqInput } from '../../src/beltless/input.js';
 const DEUTERIUM = 1121;
 const FRAC_RECIPE = 115;
 const FRAC_CHOICE = { id: FRAC_RECIPE, name: '重氢分馏（分馏塔阵列）', line: '氢 → 重氢，分馏塔阵列，单独一张蓝图' };
-/** 选了分馏：从配方里拿掉（计算器不认分馏塔），重氢不是目标时当外部供应 */
-function splitFraction(targets, raw, recipes) {
+// 原矿的默认「配方」是开采（从外面来）；有配方能做的（硅石用石矿炼）才在弹窗底部列出来开关
+const MINED = { id: null, name: '开采', line: '开采', inputs: [] };
+/**
+ * 选了分馏：从配方里拿掉（计算器不认分馏塔），重氢不是目标时当外部供应。
+ * 目标不当外部供应：页面记着以前的产线设过的外部供应，这一种又被选成目标时照常在产线里做（同 catalog）
+ */
+function splitFraction(targets, raw0, recipes) {
+  const goals = new Set(targets.map((t) => ITEMS.get(Number(t.target))?.name));
+  const raw = raw0.filter((n) => !goals.has(n));
   const on = Number(recipes?.[DEUTERIUM]) === FRAC_RECIPE;
   if (!on) return { on, raw, recipes: recipes || {} };
   const rest = { ...recipes };
@@ -229,6 +236,7 @@ function chain({ targets, raw: raw0 = [], recipes: recipes0 = {}, lab = 2901, la
   edges.push(...rawEdges.values());
   // 同一组工厂一起出的：主产物 → 这种物品，画成副产物那样的点线
   for (const u of withShared(cur)) if (u.coOf != null && !fracGoal) edges.push({ from: u.coOf, to: u.itemId, rate: u.outputRate, state: 'by' });
+  const mined = fracGoal ? [] : cur.raw.map((r) => r.itemId).filter((id) => RAW_ITEM_IDS.has(id));
   return {
     title: full.targets.map((t) => `${t.name} ${t.rate}/分`).join(' + '),
     goals,
@@ -237,15 +245,15 @@ function chain({ targets, raw: raw0 = [], recipes: recipes0 = {}, lab = 2901, la
     raws: raws.map((r) => ({ id: r.itemId, name: r.item, rate: r.rate, type: ITEMS.get(r.itemId).type })),
     blocking: fracGoal ? [] : cur.units.filter((u) => !goalIds.has(u.itemId) && !plannable(u.recipeId, u.factoryId)).map((u) => u.item),
     suggested: minimalExternal(targets, raw, recipes),
-    // 有新配方的物品（目标和还在产线里的中间产物）：弹窗底部逐个开关
-    recipes: [...full.targets.map((t) => t.itemId), ...withShared(full).map((u) => u.itemId)]
-      .filter((id, i, a) => a.indexOf(id) === i && ((id === DEUTERIUM && frac.on) || (!fracGoal && !raw.includes(ITEMS.get(id).name) && (curUnits.has(id) || full.targets.some((t) => t.itemId === id)))))
-      .map((id) => ({ id, name: ITEMS.get(id).name, choices: (id === DEUTERIUM ? [...recipeChoices(id), FRAC_CHOICE] : recipeChoices(id)).filter((r) => !UNLISTED_ALTS.has(r.id)) }))
+    // 有新配方的物品（目标、还在产线里的中间产物和开采的原矿）：弹窗底部逐个开关
+    recipes: [...full.targets.map((t) => t.itemId), ...withShared(full).map((u) => u.itemId), ...mined]
+      .filter((id, i, a) => a.indexOf(id) === i && ((id === DEUTERIUM && frac.on) || (!fracGoal && !raw.includes(ITEMS.get(id).name) && (curUnits.has(id) || mined.includes(id) || full.targets.some((t) => t.itemId === id)))))
+      .map((id) => ({ id, name: ITEMS.get(id).name, choices: (id === DEUTERIUM ? [...recipeChoices(id), FRAC_CHOICE] : RAW_ITEM_IDS.has(id) ? [MINED, ...recipeChoices(id)] : recipeChoices(id)).filter((r) => !UNLISTED_ALTS.has(r.id)) }))
       .filter((x) => x.choices.length > 1)
       .map((x) => ({
         id: x.id,
         name: x.name,
-        def: { id: x.choices[0].id, name: x.choices[0].name, line: recipeLine(x.choices[0]) },
+        def: { id: x.choices[0].id, name: x.choices[0].name, line: x.choices[0].line ?? recipeLine(x.choices[0]) },
         alts: x.choices.slice(1).map((r) => ({ id: r.id, name: r.name, line: r.line ?? recipeLine(r), ...altKey(r, x.choices[0]) })),
         chosen: x.id === DEUTERIUM && frac.on ? FRAC_RECIPE : Number(recipes[x.id]) || null,
       })),
