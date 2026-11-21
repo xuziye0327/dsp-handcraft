@@ -33,6 +33,7 @@ export default {
     'Buildings sit packed together with no belts between them. Next to them is a belt area where many belts run side by side, and sorters reach straight from the buildings to those belts to take and drop items, so it takes very little space.',
   '怎么用：': 'How to use: ',
   '蓝图贴下去建好一遍后，整片拆掉、原地重建一次，分拣器才会全部连上。': 'After pasting the blueprint and building it once, remove the whole area and rebuild it in place once more; only then will all sorters connect.',
+  '游戏机制小知识': 'Game mechanics',
   '原版计算器（DSQ）': 'Classic calculator (DSQ)',
   '源代码': 'Source code',
   'QQ 群 53309723': 'QQ group 53309723',
