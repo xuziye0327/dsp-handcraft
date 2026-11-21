@@ -558,8 +558,15 @@ body.viewer-expanded { overflow: hidden; }
 .about h2 { margin: 28px 0 4px; font-size: 15px; line-height: 22px; font-weight: 600; color: var(--text); }
 .about p { margin: 0 0 10px; }
 .about a { color: var(--accent-ink); text-underline-offset: 3px; }
-.about ul { margin: 0 0 10px; padding-left: 20px; }
-.about li { margin: 2px 0; }
+.tips-card { padding: 16px 20px 20px; background: var(--card); border: 1px solid var(--line); }
+.tips-card p { margin: 0 0 12px; }
+.tips-topics { display: flex; flex-wrap: wrap; gap: 8px; }
+.about .tips-topics a { display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px; border: 1px solid var(--line-2); color: var(--text); text-decoration: none; transition: border-color 0.15s, color 0.15s; }
+.about .tips-topics a:hover { border-color: var(--line-3); color: var(--accent-ink); }
+.tips-topics small { font: 12px var(--mono); color: var(--text-3); font-variant-numeric: tabular-nums; }
+.about .tips-all { display: inline-block; margin-top: 16px; font-weight: 500; text-decoration: none; }
+.about .tips-all::after { content: " →"; }
+.about .tips-all:hover { text-decoration: underline; }
 .faq details { border-bottom: 1px solid var(--line); }
 .faq summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; font-weight: 500; color: var(--text); list-style: none; cursor: pointer; }
 .faq summary::-webkit-details-marker { display: none; }
@@ -1309,35 +1316,11 @@ html[lang="en"] .tile .nm { -webkit-line-clamp: 3; word-break: normal; overflow-
 <details><summary>I only want the ratios, not a blueprint</summary><p>Use the <a href="calc/">production calculator</a>: pick targets and rates per minute and it lists how many of each building, how much raw material and roughly how much power you need. From there, Generate blueprint brings the line back here.</p></details>
 </div>
 <h2>Game mechanics notes</h2>
-<p>Game mechanics collected while building this generator, all on the <a href="tips/">game mechanics page</a>:</p>
-<ul class="tips">
-<li><a href="tips/#belt-throughput">How much can one belt carry?</a></li>
-<li><a href="tips/#belt-over-buildings">Can a belt pass over buildings?</a></li>
-<li><a href="tips/#belt-slope">Why does the game say a belt slope is too steep?</a></li>
-<li><a href="tips/#half-level-belts">Can blueprint belts sit at half levels? Do they collide with each other?</a></li>
-<li><a href="tips/#belt-port-height">How high can the belt at a logistics station port be?</a></li>
-<li><a href="tips/#sorter-length">Are longer sorters slower? Is picking stacked cargo faster?</a></li>
-<li><a href="tips/#pile-sorter-stack">How high does a Pile Sorter stack items on a belt?</a></li>
-<li><a href="tips/#pile-sorter-speed">How many items per minute does a Pile Sorter really move?</a></li>
-<li><a href="tips/#sorter-power">Why does a long sorter sometimes have no power?</a></li>
-<li><a href="tips/#sorter-angle">Why will a sorter not connect to a raised belt?</a></li>
-<li><a href="tips/#piler">Can an Automatic Piler stack cargo 4 high?</a></li>
-<li><a href="tips/#proliferator">How does proliferator have to be sprayed to work?</a></li>
-<li><a href="tips/#spray-coater-stack">Can Spray Coaters be stacked? How should the proliferator belt reach them?</a></li>
-<li><a href="tips/#fractionator">How much Deuterium does one Fractionator make?</a></li>
-<li><a href="tips/#traffic-monitor">How does the Traffic Monitor count? Why did a pasted monitor not attach to its belt?</a></li>
-<li><a href="tips/#power-range">How far do Tesla Towers and Satellite Substations reach?</a></li>
-<li><a href="tips/#thermal-power">Does a Thermal Power Plant make more power with better fuel?</a></li>
-<li><a href="tips/#station-distance">How close can two logistics stations be?</a></li>
-<li><a href="tips/#station-same-item">Can a station both import an item and take the same item as a byproduct?</a></li>
-<li><a href="tips/#station-no-sorters">Can a sorter take items straight from a logistics station?</a></li>
-<li><a href="tips/#tank-and-distributor">How do Storage Tanks and Logistics Distributors connect?</a></li>
-<li><a href="tips/#latitude">Why does a blueprint fit at the equator but collide at another latitude?</a></li>
-<li><a href="tips/#building-spacing">How tightly can buildings be packed?</a></li>
-<li><a href="tips/#collider-sizes">How big are the buildings' collision boxes?</a></li>
-<li><a href="tips/#paste-collision">How does the game decide whether a pasted blueprint collides?</a></li>
-<li><a href="tips/#beltless-repaste">The sorters in a beltless blueprint did not connect. What now?</a></li>
-</ul>
+<div class="tips-card">
+<p>Belt throughput, Pile Sorter stacking, station spacing, collision boxes and more: 26 game mechanics notes collected while building this generator.</p>
+<nav class="tips-topics" aria-label="Game mechanics notes"><a href="tips/#belts">Belts<small>5</small></a><a href="tips/#sorters">Sorters<small>5</small></a><a href="tips/#piling">Piling, proliferator and fractionators<small>5</small></a><a href="tips/#power">Power<small>2</small></a><a href="tips/#stations">Logistics stations and storage<small>4</small></a><a href="tips/#buildings">Buildings, collisions and latitude<small>4</small></a><a href="tips/#beltless">Beltless blueprints<small>1</small></a></nav>
+<a class="tips-all" href="tips/">See all 26 notes</a>
+</div>
 </section>
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","inLanguage":"en","mainEntity":[{"@type":"Question","name":"How do I get the blueprint into the game?","acceptedAnswer":{"@type":"Answer","text":"When the layout is done, click Copy blueprint; the blueprint code is now on your clipboard. In the game, press Ctrl+V to enter blueprint paste mode, click Paste Blueprint Code on the blueprint panel, then pick a spot and build. You can also create a new blueprint in the Blueprint Library, paste the code there and save it for later. Blueprints become available in the game once you have researched Mass Construction."}},{"@type":"Question","name":"What can it lay out?","acceptedAnswer":{"@type":"Answer","text":"Almost anything made in a factory building: iron ingots, circuit boards, processors, all the way up to the six matrices (Electromagnetic, Energy, Structure, Information, Gravity and Universe Matrix, also known as blue to white science). You can add several targets and get them in one blueprint. It also makes fractionator arrays for deuterium."}},{"@type":"Question","name":"I have not unlocked some of the buildings. Can I change them?","acceptedAnswer":{"@type":"Answer","text":"Yes. The buttons above the drawing let you pick the belt, sorter, smelter, assembler, chemical plant and lab, whether to use proliferator, Tesla Towers or Satellite Substations for power, and whether materials come and go by belt, storage or logistics stations. Choose what your save has unlocked."}},{"@type":"Question","name":"Does it support proliferator?","acceptedAnswer":{"@type":"Answer","text":"Yes. The last button above the drawing sets the proliferator grade. The blueprint then includes the spray coaters and the belts that feed them."}},{"@type":"Question","name":"Where on the planet can I paste it?","acceptedAnswer":{"@type":"Answer","text":"If the line has Chemical Plants or Oil Refineries, the default spacing only fits near the equator. To paste at other latitudes, set \"High-latitude spacing for Chemical Plants and refineries\" in the left panel to \"Any latitude\" before you generate."}},{"@type":"Question","name":"The game says the blueprint has too many facilities. What now?","acceptedAnswer":{"@type":"Answer","text":"How many facilities one blueprint can place is set by your Mass Construction research level, so a large blueprint will not fit at low levels. Research it further, or lower the rate per minute and build the line as several smaller blueprints."}},{"@type":"Question","name":"How long does it take?","acceptedAnswer":{"@type":"Answer","text":"A small line of a few dozen buildings takes seconds to tens of seconds; a few hundred buildings take minutes. The estimate is shown under the Generate blueprint button before you start. The Polished search effort takes longer and aims for a wide layout close to the shape of your screen."}},{"@type":"Question","name":"Can I trust the result?","acceptedAnswer":{"@type":"Answer","text":"Every blueprint is checked independently after it is generated: building collisions, belt connections, sorter reach and power coverage. The outcome is listed under Checks. If a layout fails, the page says so and you should not paste it."}},{"@type":"Question","name":"How is this different from downloading a ready-made blueprint?","acceptedAnswer":{"@type":"Answer","text":"A ready-made blueprint comes with someone else's output rate and choice of buildings. This tool lays out a line for exactly the rate you ask for, with the buildings you have unlocked."}},{"@type":"Question","name":"Is it free? Does it need a connection?","acceptedAnswer":{"@type":"Answer","text":"Free and open source (GPL-3.0). The layout is computed in your own browser and your production line is not uploaded. To use it offline, download the repository from GitHub, unzip it and open en/index.html."}},{"@type":"Question","name":"I only want the ratios, not a blueprint","acceptedAnswer":{"@type":"Answer","text":"Use the production calculator: pick targets and rates per minute and it lists how many of each building, how much raw material and roughly how much power you need. From there, Generate blueprint brings the line back here."}}]}</script>
   </main>

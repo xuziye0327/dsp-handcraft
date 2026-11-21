@@ -2,7 +2,7 @@
 // 中文、英文各写各的，同一页两种语言的问题条数、顺序要一样（test/site.test.js 查）。
 // 写法：lead、a 是一段一个字符串的纯文字；只认一种标记 [文字](网址)，网址写相对这一页的（calc/ 在两种语言的入口上都对）或 https:// 开头的。
 // 游戏里的按钮、科技名照游戏自带的文字写（粘贴蓝图代码 / Paste Blueprint Code，批量建造 / Mass Construction），页面上的按钮名照页面写。
-// tipsTitle、tipsLead（只有生成器有）：常见问题后面列出游戏机制那一页（下面的 TIPS）的问题，链过去。
+// tipsTitle、tipsLead、tipsAll（只有生成器有）：常见问题后面一张卡片，链到游戏机制那一页（下面的 TIPS）的各个分组；{n} 换成条数。
 
 const REPO = 'https://github.com/zoujack018/dsp-handcraft';
 const DSQ = 'https://github.com/122474363/DSQ';
@@ -70,7 +70,8 @@ export const ABOUT = {
         },
       ],
       tipsTitle: '游戏机制小知识',
-      tipsLead: '做这个生成器时整理的游戏机制，都放在[游戏机制小知识](tips/)那一页：',
+      tipsLead: '传送带运力、集装分拣器叠几层、物流站间距、建筑碰撞框……做这个生成器时整理的 {n} 条游戏机制。',
+      tipsAll: '看全部 {n} 条',
     },
     en: {
       title: 'Dyson Sphere Program Blueprint Generator',
@@ -132,7 +133,8 @@ export const ABOUT = {
         },
       ],
       tipsTitle: 'Game mechanics notes',
-      tipsLead: 'Game mechanics collected while building this generator, all on the [game mechanics page](tips/):',
+      tipsLead: 'Belt throughput, Pile Sorter stacking, station spacing, collision boxes and more: {n} game mechanics notes collected while building this generator.',
+      tipsAll: 'See all {n} notes',
     },
   },
   // 量产计算器：/calc/ 和 /en/calc/

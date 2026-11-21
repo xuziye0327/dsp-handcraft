@@ -84,6 +84,12 @@ const faqLd = (items, inLanguage, lang) => ({
   mainEntity: items.map((x) => ({ '@type': 'Question', name: x.q, acceptedAnswer: { '@type': 'Answer', text: x.a.map(plain).join(lang === 'en' ? ' ' : '') } })),
 });
 const tipItems = (lang) => TIPS[lang].groups.flatMap((g) => g.items);
+/** 生成器页面底下去游戏机制页的卡片：一句说明、各分组（带条数）、看全部 */
+const tipsCard = (a, lang, h) => {
+  const n = String(tipItems(lang).length);
+  const groups = TIPS[lang].groups.map((g) => `<a href="tips/#${g.id}">${esc(g.title)}<small>${g.items.length}</small></a>`);
+  return [`<h${h}>${esc(a.tipsTitle)}</h${h}>`, '<div class="tips-card">', `<p>${esc(a.tipsLead.replace('{n}', n))}</p>`, `<nav class="tips-topics" aria-label="${esc(a.tipsTitle)}">${groups.join('')}</nav>`, `<a class="tips-all" href="tips/">${esc(a.tipsAll.replace('{n}', n))}</a>`, '</div>'];
+};
 const ldScript = (ld) => `<script type="application/ld+json">${JSON.stringify(ld).replace(/</g, '\\u003c')}</script>`;
 /**
  * 入口页面底下的简介和常见问题（web/faq.js 里这一页、这种语言的那份），后面跟 FAQPage 结构化数据。
@@ -102,9 +108,7 @@ const about = (kind, pages, lang) => {
     ...a.faq.map((x) => `<details><summary>${esc(x.q)}</summary>${x.a.map((p) => `<p>${rich(p)}</p>`).join('')}</details>`),
     '</div>',
     // 游戏机制实测（只有生成器有）：列出那一页的问题，各自链到那一页上的锚点
-    ...(a.tipsTitle
-      ? [`<h${h + 1}>${esc(a.tipsTitle)}</h${h + 1}>`, `<p>${rich(a.tipsLead)}</p>`, '<ul class="tips">', ...tipItems(lang).map((x) => `<li><a href="tips/#${x.id}">${esc(x.q)}</a></li>`), '</ul>']
-      : []),
+    ...(a.tipsTitle ? tipsCard(a, lang, h + 1) : []),
     '</section>',
     `<script type="application/ld+json">${JSON.stringify(ld).replace(/</g, '\\u003c')}</script>`,
   ].join('\n');

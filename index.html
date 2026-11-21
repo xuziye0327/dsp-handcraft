@@ -558,8 +558,15 @@ body.viewer-expanded { overflow: hidden; }
 .about h2 { margin: 28px 0 4px; font-size: 15px; line-height: 22px; font-weight: 600; color: var(--text); }
 .about p { margin: 0 0 10px; }
 .about a { color: var(--accent-ink); text-underline-offset: 3px; }
-.about ul { margin: 0 0 10px; padding-left: 20px; }
-.about li { margin: 2px 0; }
+.tips-card { padding: 16px 20px 20px; background: var(--card); border: 1px solid var(--line); }
+.tips-card p { margin: 0 0 12px; }
+.tips-topics { display: flex; flex-wrap: wrap; gap: 8px; }
+.about .tips-topics a { display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px; border: 1px solid var(--line-2); color: var(--text); text-decoration: none; transition: border-color 0.15s, color 0.15s; }
+.about .tips-topics a:hover { border-color: var(--line-3); color: var(--accent-ink); }
+.tips-topics small { font: 12px var(--mono); color: var(--text-3); font-variant-numeric: tabular-nums; }
+.about .tips-all { display: inline-block; margin-top: 16px; font-weight: 500; text-decoration: none; }
+.about .tips-all::after { content: " →"; }
+.about .tips-all:hover { text-decoration: underline; }
 .faq details { border-bottom: 1px solid var(--line); }
 .faq summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; font-weight: 500; color: var(--text); list-style: none; cursor: pointer; }
 .faq summary::-webkit-details-marker { display: none; }
@@ -1309,35 +1316,11 @@ html[lang="en"] .tile .nm { -webkit-line-clamp: 3; word-break: normal; overflow-
 <details><summary>我只想算配比，不要蓝图</summary><p>用<a href="calc/">量产计算器</a>：选目标和每分钟产量，列出每种设备要几台、要多少原料、大约用多少电。算好的产线点「生成蓝图」就带回这里排。</p></details>
 </div>
 <h2>游戏机制小知识</h2>
-<p>做这个生成器时整理的游戏机制，都放在<a href="tips/">游戏机制小知识</a>那一页：</p>
-<ul class="tips">
-<li><a href="tips/#belt-throughput">一条传送带最多能运多少？</a></li>
-<li><a href="tips/#belt-over-buildings">传送带能从建筑头顶过吗？</a></li>
-<li><a href="tips/#belt-slope">为什么贴蓝图时报传送带「坡度太陡」？</a></li>
-<li><a href="tips/#half-level-belts">蓝图里的传送带能放在半层高吗？会不会互相撞？</a></li>
-<li><a href="tips/#belt-port-height">接物流站的传送带能抬多高？</a></li>
-<li><a href="tips/#sorter-length">分拣器越长越慢吗？取叠层的料会更快吗？</a></li>
-<li><a href="tips/#pile-sorter-stack">集装分拣器往带上能叠几层？</a></li>
-<li><a href="tips/#pile-sorter-speed">集装分拣器实际每分钟能送多少？</a></li>
-<li><a href="tips/#sorter-power">很长的分拣器为什么有时没电？</a></li>
-<li><a href="tips/#sorter-angle">分拣器接高处的带子为什么贴不上？</a></li>
-<li><a href="tips/#piler">自动集装机能把货物叠到 4 层吗？</a></li>
-<li><a href="tips/#proliferator">增产剂要怎么喷才有效？</a></li>
-<li><a href="tips/#spray-coater-stack">喷涂机能叠起来吗？给喷涂机送增产剂的带子怎么接？</a></li>
-<li><a href="tips/#fractionator">一座分馏塔能出多少重氢？</a></li>
-<li><a href="tips/#traffic-monitor">流速监测器怎么数？蓝图里的监测器为什么没挂上带子？</a></li>
-<li><a href="tips/#power-range">电力感应塔、卫星配电站能供到多远？</a></li>
-<li><a href="tips/#thermal-power">火力发电厂烧好燃料能多发电吗？</a></li>
-<li><a href="tips/#station-distance">两座物流站最近能挨多近？</a></li>
-<li><a href="tips/#station-same-item">同一种东西既要运进来、又有副产出，能放在同一座物流站吗？</a></li>
-<li><a href="tips/#station-no-sorters">分拣器能直接从物流站取货吗？</a></li>
-<li><a href="tips/#tank-and-distributor">储液罐、物流配送器怎么接？</a></li>
-<li><a href="tips/#latitude">为什么蓝图在赤道能贴，换个纬度就撞？</a></li>
-<li><a href="tips/#building-spacing">建筑之间最紧能挨多近？</a></li>
-<li><a href="tips/#collider-sizes">各种建筑的碰撞框到底多大？</a></li>
-<li><a href="tips/#paste-collision">贴蓝图时游戏怎么判断撞没撞？</a></li>
-<li><a href="tips/#beltless-repaste">无带流蓝图贴下去，分拣器没连上怎么办？</a></li>
-</ul>
+<div class="tips-card">
+<p>传送带运力、集装分拣器叠几层、物流站间距、建筑碰撞框……做这个生成器时整理的 26 条游戏机制。</p>
+<nav class="tips-topics" aria-label="游戏机制小知识"><a href="tips/#belts">传送带<small>5</small></a><a href="tips/#sorters">分拣器<small>5</small></a><a href="tips/#piling">集装、喷涂和分馏<small>5</small></a><a href="tips/#power">供电<small>2</small></a><a href="tips/#stations">物流站和仓储<small>4</small></a><a href="tips/#buildings">建筑、碰撞和纬度<small>4</small></a><a href="tips/#beltless">无带流蓝图<small>1</small></a></nav>
+<a class="tips-all" href="tips/">看全部 26 条</a>
+</div>
 </section>
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","inLanguage":"zh-CN","mainEntity":[{"@type":"Question","name":"生成的蓝图怎么贴进游戏？","acceptedAnswer":{"@type":"Answer","text":"排好以后点「复制蓝图」，蓝图代码就在剪贴板里了。进游戏按 Ctrl+V 进入蓝图粘贴模式，在蓝图面板上点「粘贴蓝图代码」，再选位置建造。也可以在蓝图库里新建一个蓝图，粘贴代码后保存，以后随时取用。游戏里要先研究「批量建造」科技才有蓝图功能。"}},{"@type":"Question","name":"能排哪些产线？","acceptedAnswer":{"@type":"Answer","text":"游戏里用工厂造的东西基本都能当目标：铁块、电路板、处理器，一直到六种矩阵（电磁矩阵、能量矩阵、结构矩阵、信息矩阵、引力矩阵、宇宙矩阵，也就是玩家说的蓝糖、红糖、黄糖、紫糖、绿糖、白糖）。一次可以加几个目标，排进同一张图。也能排重氢的分馏塔阵列。"}},{"@type":"Question","name":"蓝图里用到的建筑我还没解锁，能换吗？","acceptedAnswer":{"@type":"Answer","text":"能。图纸上方那排按钮可以换传送带、分拣器、熔炉、制造台、化工厂、研究站的型号，选喷不喷增产剂，供电用电力感应塔还是卫星配电站，原料和成品走传送带、箱子还是物流站。照你存档里已经解锁的选就行。"}},{"@type":"Question","name":"能喷增产剂吗？","acceptedAnswer":{"@type":"Answer","text":"能。图纸上方最后一个按钮选增产剂的等级，蓝图里会带上喷涂机和给喷涂机送增产剂的传送带。"}},{"@type":"Question","name":"蓝图能贴在星球的什么位置？","acceptedAnswer":{"@type":"Answer","text":"产线里有化工厂、原油精炼厂时，默认的间距只适合贴在赤道附近。要贴到别的纬度，把左栏「化工厂、精炼厂高纬度间距展开」选成「开（任何纬度）」再生成。"}},{"@type":"Question","name":"贴的时候游戏说设施数量超了怎么办？","acceptedAnswer":{"@type":"Answer","text":"一张蓝图一次能建多少设施，由游戏里「批量建造」科技的级别决定，级别低时大蓝图贴不下。把这项科技升上去，或者把每分钟产量调小、分成几张排。"}},{"@type":"Question","name":"生成一张要等多久？","acceptedAnswer":{"@type":"Answer","text":"几十台的小产线几秒到几十秒，几百台的大产线要几分钟。点「生成蓝图」之前，按钮下面会写预计用时。「搜索力度」选「美观」会多花些时间，尽量把图排成和屏幕差不多的横向形状。"}},{"@type":"Question","name":"生成的蓝图靠得住吗？","acceptedAnswer":{"@type":"Answer","text":"每张蓝图出来以后都会另外检查一遍：建筑有没有相撞、传送带接没接上、分拣器够不够得着、电有没有供到，结果列在「检查」里。没通过的图页面会明说，不建议贴。"}},{"@type":"Question","name":"和从蓝图网站下载现成的蓝图有什么不同？","acceptedAnswer":{"@type":"Answer","text":"现成蓝图的产量和用的建筑是别人定的。这里按你要的每分钟产量、你已经解锁的建筑现排一张，不多不少。"}},{"@type":"Question","name":"免费吗？要联网吗？","acceptedAnswer":{"@type":"Answer","text":"免费，开源（GPL-3.0）。排布全在你自己的浏览器里算，不上传你的产线。想离线用，到 GitHub 下载整份，解压后打开 index.html 就行。"}},{"@type":"Question","name":"我只想算配比，不要蓝图","acceptedAnswer":{"@type":"Answer","text":"用量产计算器：选目标和每分钟产量，列出每种设备要几台、要多少原料、大约用多少电。算好的产线点「生成蓝图」就带回这里排。"}}]}</script>
   </main>

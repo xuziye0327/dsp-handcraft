@@ -539,8 +539,15 @@ body.viewer-expanded { overflow: hidden; }
 .about h2 { margin: 28px 0 4px; font-size: 15px; line-height: 22px; font-weight: 600; color: var(--text); }
 .about p { margin: 0 0 10px; }
 .about a { color: var(--accent-ink); text-underline-offset: 3px; }
-.about ul { margin: 0 0 10px; padding-left: 20px; }
-.about li { margin: 2px 0; }
+.tips-card { padding: 16px 20px 20px; background: var(--card); border: 1px solid var(--line); }
+.tips-card p { margin: 0 0 12px; }
+.tips-topics { display: flex; flex-wrap: wrap; gap: 8px; }
+.about .tips-topics a { display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px; border: 1px solid var(--line-2); color: var(--text); text-decoration: none; transition: border-color 0.15s, color 0.15s; }
+.about .tips-topics a:hover { border-color: var(--line-3); color: var(--accent-ink); }
+.tips-topics small { font: 12px var(--mono); color: var(--text-3); font-variant-numeric: tabular-nums; }
+.about .tips-all { display: inline-block; margin-top: 16px; font-weight: 500; text-decoration: none; }
+.about .tips-all::after { content: " →"; }
+.about .tips-all:hover { text-decoration: underline; }
 .faq details { border-bottom: 1px solid var(--line); }
 .faq summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; font-weight: 500; color: var(--text); list-style: none; cursor: pointer; }
 .faq summary::-webkit-details-marker { display: none; }
