@@ -32,15 +32,78 @@ const MINED = { id: null, name: '开采', line: '开采', inputs: [] };
  * 选了分馏：从配方里拿掉（计算器不认分馏塔），重氢不是目标时当外部供应。
  * 目标不当外部供应：页面记着以前的产线设过的外部供应，这一种又被选成目标时照常在产线里做（同 catalog）
  */
-function splitFraction(targets, raw0, recipes) {
+function splitFraction(targets, raw0, recipes, rare = null) {
   const goals = new Set(targets.map((t) => ITEMS.get(Number(t.target))?.name));
   const raw = raw0.filter((n) => !goals.has(n));
   const on = Number(recipes?.[DEUTERIUM]) === FRAC_RECIPE;
-  if (!on) return { on, raw, recipes: recipes || {} };
+  if (!on) return { on, ...rareDefaults(targets, raw, recipes || {}, rare) };
   const rest = { ...recipes };
   delete rest[DEUTERIUM];
   const isGoal = targets.some((t) => Number(t.target) === DEUTERIUM);
-  return { on, raw: isGoal || raw.includes('重氢') ? raw : [...raw, '重氢'], recipes: rest, isGoal };
+  const fracRaw = isGoal || raw.includes('重氢') ? raw : [...raw, '重氢'];
+  return { on, ...(isGoal ? rareDefaults(targets, fracRaw, rest, null) : rareDefaults(targets, fracRaw, rest, rare)), isGoal };
+}
+
+/** 页面参数里的珍奇默认：rare 开着时 { off: 玩家关掉的物品 ID }，关着（量产计算器带过来的方案、以前存过设置的）为 null */
+const rareOf = (p) => (p.rare ? { off: Array.isArray(p.rareOff) ? p.rareOff : [] } : null);
+const rareDefaults = (targets, raw, recipes, rare) => (rare ? withRare(targets, raw, recipes, rare.off) : { raw, recipes, auto: [], autoExt: [] });
+/** 有矿脉、也能在产线里做的珍奇：默认当原矿开采（外部供应） */
+const RARE_RAW = 1117; // 有机晶体
+/** 配方出得最多的是不是这种物品（可燃冰做石墨烯：石墨烯是，顺带出的氢不是） */
+const mainOutput = (r, id) => r.outputs.reduce((a, b) => (b.count > a.count ? b : a)).id === id;
+/** 这种物品用珍奇做、它又是主产物的配方（没有为 null） */
+function rareAlt(id) {
+  const r = recipeChoices(id).slice(1).find((c) => c.inputs.some((x) => RARE_ORES.has(x.id)) && mainOutput(c, id));
+  return r ? r.id : null;
+}
+/**
+ * 珍奇默认用上（同量产计算器左栏的珍奇矿默认都有）：现在这条线里（设了外部供应的不算）没自己选过配方的物品，
+ * 有用珍奇做、它又是主产物的配方就换过去；有机晶体在产线里做的改成外部供应。
+ * 氢不跟着可燃冰换：网页的计算不拿副产物抵需要，氢也用石墨烯（高效）做会多出几倍石墨烯（卡西米尔晶体要的氢是石墨烯的 6 倍）。
+ * off 里的物品（玩家关掉的）照默认配方、照常在产线里做。换了配方线会变（卡西米尔晶体换了就不要钛块），反复推到不再变。
+ * 返回换好的 raw、recipes，auto 是换了配方的物品 ID，autoExt 是改成外部供应的物品名（页面左栏照样列出来、能关）
+ */
+function withRare(targets, raw0, recipes0, off) {
+  let raw = [...raw0];
+  const recipes = { ...recipes0 };
+  let auto = [];
+  let autoExt = [];
+  const skip = new Set(off.map(Number));
+  const goals = new Set(targets.map((t) => Number(t.target)));
+  const input = targets.map((t) => ({ target: Number(t.target), rate: t.rate > 0 ? Number(t.rate) : 60 })); // 线上有哪些物品和产量无关
+  for (let round = 0; round < 10; round++) {
+    let c;
+    try {
+      c = calculate({ targets: input, raw, recipes });
+    } catch {
+      break; // 目标不认识这类：照原样，报错留给后面
+    }
+    let changed = false;
+    for (const id of new Set([...c.targets.map((t) => t.itemId), ...c.units.map((u) => u.itemId)])) {
+      if (skip.has(id) || recipes[id] != null) continue;
+      if (id === RARE_RAW && !goals.has(id)) {
+        const name = ITEMS.get(id).name;
+        raw.push(name);
+        autoExt.push(name);
+        changed = true;
+        continue;
+      }
+      const alt = rareAlt(id);
+      if (alt == null) continue;
+      recipes[id] = alt;
+      auto.push(id);
+      changed = true;
+    }
+    if (changed) continue;
+    // 推定了：前几轮换上、后来线上又用不着的（卡西米尔晶体换了配方就不要钛晶石，有机晶体也就不用接）不算
+    const inLine = new Set([...c.targets.map((t) => t.itemId), ...c.units.map((u) => u.itemId)]);
+    const used = new Set(c.raw.map((r) => r.item));
+    raw = raw.filter((n) => !autoExt.includes(n) || used.has(n));
+    autoExt = autoExt.filter((n) => used.has(n));
+    auto = auto.filter((id) => inLine.has(id));
+    break;
+  }
+  return { raw, recipes, auto, autoExt };
 }
 
 // 搜索力度分档（quick 快、normal 标准、fine 细，细档也叫美观档）：空间利用率达到 targetSpace 就停，没达到就把面积的权重加倍再搜，最多 retries 轮。
@@ -151,8 +214,8 @@ const withShared = (calc) =>
  *   recipes：有新配方的物品，每个新配方带 ore（原料里的珍奇矿物，没有为 null）和 key（弹窗里给它配图标的物品）。
  *   suggested：让整条线可排的最少外部供应（基于当前选择补齐）。
  */
-function chain({ targets, raw: raw0 = [], recipes: recipes0 = {}, lab = 2901, labStack = 15 }) {
-  const frac = splitFraction(targets, raw0, recipes0);
+function chain({ targets, raw: raw0 = [], recipes: recipes0 = {}, lab = 2901, labStack = 15, rare = false, rareOff = [] }) {
+  const frac = splitFraction(targets, raw0, recipes0, rareOf({ rare, rareOff }));
   const raw = frac.raw;
   const recipes = frac.recipes;
   const full = calculate({ targets, raw: [], recipes, lab: Number(lab), labStack: Number(labStack) });
@@ -244,7 +307,8 @@ function chain({ targets, raw: raw0 = [], recipes: recipes0 = {}, lab = 2901, la
     edges,
     raws: raws.map((r) => ({ id: r.itemId, name: r.item, rate: r.rate, type: ITEMS.get(r.itemId).type })),
     blocking: fracGoal ? [] : cur.units.filter((u) => !goalIds.has(u.itemId) && !plannable(u.recipeId, u.factoryId)).map((u) => u.item),
-    suggested: minimalExternal(targets, raw, recipes),
+    suggested: minimalExternal(targets, raw, recipes).filter((n) => !frac.autoExt.includes(n)), // 珍奇默认改成外部供应的不算建议（页面不用再加）
+    autoExt: frac.autoExt, // 珍奇默认改成外部供应的（有机晶体），弹窗里它的卡照样能点
     // 有新配方的物品（目标、还在产线里的中间产物和开采的原矿）：弹窗底部逐个开关
     recipes: [...full.targets.map((t) => t.itemId), ...withShared(full).map((u) => u.itemId), ...mined]
       .filter((id, i, a) => a.indexOf(id) === i && ((id === DEUTERIUM && frac.on) || (!fracGoal && !raw.includes(ITEMS.get(id).name) && (curUnits.has(id) || mined.includes(id) || full.targets.some((t) => t.itemId === id)))))
@@ -254,7 +318,7 @@ function chain({ targets, raw: raw0 = [], recipes: recipes0 = {}, lab = 2901, la
         id: x.id,
         name: x.name,
         def: { id: x.choices[0].id, name: x.choices[0].name, line: x.choices[0].line ?? recipeLine(x.choices[0]) },
-        alts: x.choices.slice(1).map((r) => ({ id: r.id, name: r.name, line: r.line ?? recipeLine(r), ...altKey(r, x.choices[0]) })),
+        alts: x.choices.slice(1).map((r) => ({ id: r.id, name: r.name, line: r.line ?? recipeLine(r), ...altKey(r, x.choices[0], x.id) })),
         chosen: x.id === DEUTERIUM && frac.on ? FRAC_RECIPE : Number(recipes[x.id]) || null,
       })),
     // 几种物品选了同一道配方、合成一组时，用不完的那部分（calculator.js 的 flow.extra，跟着那条带送出）
@@ -270,14 +334,14 @@ const UNLISTED_ALTS = new Set([54]);
 const RARE_ORES = new Set([1011, 1012, 1013, 1014, 1015, 1016]); // 可燃冰、金伯利矿石、分形硅石、光栅石、刺笋结晶、单极磁石
 /**
  * 新配方的「关键原料」：ore 是原料里的珍奇矿物；key 是弹窗里给它配图标的物品——有珍奇就是珍奇，没有就是默认配方不用的第一种原料
- * （有机晶体（原始）的木材、空间翘曲器（高级）的引力矩阵），重氢分馏是分馏塔
+ * （有机晶体（原始）的木材、空间翘曲器（高级）的引力矩阵），重氢分馏是分馏塔；main：这种物品是不是它的主产物（用珍奇做的才看，见 withRare）
  */
-function altKey(r, def) {
-  if (r.id === FRAC_RECIPE) return { ore: null, key: { id: 2314, name: ITEMS.get(2314).name } };
+function altKey(r, def, itemId) {
+  if (r.id === FRAC_RECIPE) return { ore: null, key: { id: 2314, name: ITEMS.get(2314).name }, main: true };
   const ore = r.inputs.find((x) => RARE_ORES.has(x.id));
   const key = ore ?? r.inputs.find((x) => !def.inputs.some((y) => y.id === x.id)) ?? r.inputs[0];
   const it = (x) => (x ? { id: x.id, name: ITEMS.get(x.id).name } : null);
-  return { ore: it(ore), key: it(key) };
+  return { ore: it(ore), key: it(key), main: !ore || mainOutput(r, itemId) };
 }
 
 
@@ -714,7 +778,7 @@ function lineInput(p, targets, frac) {
 
 async function run(p, id = 0) {
   const targets = (p.targets || [{ target: p.target, rate: p.rate }]).map((t) => ({ target: Number(t.target), rate: Number(t.rate) }));
-  const frac = splitFraction(targets, (p.raw || []).filter(Boolean), p.recipes || {});
+  const frac = splitFraction(targets, (p.raw || []).filter(Boolean), p.recipes || {}, rareOf(p));
   if (frac.on && frac.isGoal) {
     if (targets.length > 1) return { error: '重氢选了分馏塔阵列时，目标只能是重氢一种（分馏阵列单独一张蓝图）。可以把别的目标另外生成，重氢设为外部供应。' };
     return fractionRun(targets[0].rate, Number(p.spray || 0), arrayLimits(p), p.stationPrefs, p.fracengine === 'anneal' ? EFFORT_ARRAY[p.effort === 'fine' ? 'fine' : 'normal'] : null);
@@ -744,10 +808,12 @@ async function run(p, id = 0) {
  *   power：工厂满负荷用电（还没排，分拣器、喷涂机、物流站不算）；
  *   chainItems：不设外部供应时这条线用到的物品（目标、中间产物、原料），页面左栏只列当前产线用得上的外部供应、新配方；算不出来为 null
  *   supplied：按现在的外部供应，产线从外面要的物品名（设了外部供应、可现在没人用的不在里面，左栏不列）；算不出来为 null
+ *   autoRecipes、autoExt：珍奇默认换了配方的物品 ID、改成外部供应的物品名（withRare），左栏和自己选的一起列
  */
 function forecast(p) {
   const targets = (p.targets || [{ target: p.target, rate: p.rate }]).map((t) => ({ target: Number(t.target), rate: Number(t.rate) }));
-  const frac = splitFraction(targets, (p.raw || []).filter(Boolean), p.recipes || {});
+  const frac = splitFraction(targets, (p.raw || []).filter(Boolean), p.recipes || {}, rareOf(p));
+  const rare = { autoRecipes: frac.auto, autoExt: frac.autoExt };
   let chainItems = null;
   let supplied = null;
   try {
@@ -760,15 +826,15 @@ function forecast(p) {
     chainItems = null;
   }
   try {
-    if (!targets.every((t) => t.rate > 0)) return { error: '每分钟产量需要是正数。', chainItems, supplied };
+    if (!targets.every((t) => t.rate > 0)) return { error: '每分钟产量需要是正数。', chainItems, supplied, ...rare };
     if (frac.on && frac.isGoal) {
-      if (targets.length > 1) return { error: '重氢选了分馏塔阵列时，目标只能是重氢一种。', chainItems, supplied };
+      if (targets.length > 1) return { error: '重氢选了分馏塔阵列时，目标只能是重氢一种。', chainItems, supplied, ...rare };
       // 分馏塔阵列：照 fractionRun 生成一遍数塔（几毫秒）；一座站带不动时这张图要贴几份，塔数、用电都乘上
       // 退火排法：不在预告里退火，按稳态够数要几座塔、几台集装机和喷涂机估（annealedEstimate）
       const r = p.fracengine === 'anneal' ? annealedEstimate(targets[0].rate, { spray: Number(p.spray || 0) }) : fractionatorArray(targets[0].rate, { spray: Number(p.spray || 0), ...arrayLimits(p) });
       const k = r.plan.copies;
       const e = fracEnergy(r);
-      return { machines: r.fracs * k, byFactory: [{ name: '分馏塔', count: r.fracs * k }], seconds: 0, power: forecastPower(e.idle * k, e.work * k, e.sprayExtra * k), chainItems: [DEUTERIUM], supplied };
+      return { machines: r.fracs * k, byFactory: [{ name: '分馏塔', count: r.fracs * k }], seconds: 0, power: forecastPower(e.idle * k, e.work * k, e.sprayExtra * k), chainItems: [DEUTERIUM], supplied, ...rare };
     }
     const calc = calculate(lineInput(p, targets, frac));
     const by = new Map();
@@ -782,9 +848,10 @@ function forecast(p) {
       power: forecastPower(e.idle, e.work, e.sprayExtra),
       chainItems,
       supplied,
+      ...rare,
     };
   } catch (e) {
-    return { error: e.message, chainItems, supplied };
+    return { error: e.message, chainItems, supplied, ...rare };
   }
 }
 const forecastPower = (idle, work, sprayExtra) => ({ idle, work, sprayExtra, idleText: fmtWatts(idle), workText: fmtWatts(work), maxText: fmtWatts(work + sprayExtra) });
@@ -1292,7 +1359,7 @@ self.onmessage = async (ev) => {
       try {
         const p = msg.params;
         const targets = p.targets.map((t) => ({ target: Number(t.target), rate: Number(t.rate) }));
-        const frac = splitFraction(targets, (p.raw || []).filter(Boolean), p.recipes || {});
+        const frac = splitFraction(targets, (p.raw || []).filter(Boolean), p.recipes || {}, rareOf(p));
         if (frac.on && frac.isGoal) throw new Error('重氢选了分馏塔阵列，无带蓝图排不了');
         const calc = calculate(lineInput({ ...p, supply: '' }, targets, frac));
         const plan = dsqInput(calc, { belt: p.belt, sorter: p.sorter, labStack: p.labstack });

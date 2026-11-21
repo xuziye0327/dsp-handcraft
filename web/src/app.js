@@ -11,7 +11,7 @@ import { blueprintLabel, relabelBlueprint } from '../../src/codec/relabel.js';
 
 const $ = (id) => document.getElementById(id);
 const STORE = 'dsp-handcraft:settings';
-const DEFAULTS = { targetId: 6005, rate: 60, ext: [], recipes: {}, assembler: '2303', smelter: '2302', chemical: '2309', lab: '2901', labstack: 15, belt: '3', sorter: '2014', power: 'substation', station: 'ils', pile: '1', pilertech: '0', spray: '0', warper: '0', maxwidth: '', maxheight: '', aspect: '', orient: 'h', effort: 'normal', page: 1, chemwide: '0', defs: null, supply: '', dist: '0', stationPrefs: null, fracengine: 'template' };
+const DEFAULTS = { targetId: 6005, rate: 60, ext: [], recipes: {}, assembler: '2303', smelter: '2302', chemical: '2309', lab: '2901', labstack: 15, belt: '3', sorter: '2014', power: 'substation', station: 'ils', pile: '1', pilertech: '0', spray: '0', warper: '0', maxwidth: '', maxheight: '', aspect: '', orient: 'h', effort: 'normal', page: 1, chemwide: '0', defs: null, supply: '', dist: '0', stationPrefs: null, fracengine: 'template', rare: true, rareOff: [] };
 const OPTION_NAMES = ['assembler', 'smelter', 'chemical', 'chemwide', 'lab', 'belt', 'sorter', 'station', 'supply', 'dist', 'pile', 'pilertech', 'power', 'spray', 'warper', 'maxwidth', 'maxheight', 'aspect', 'effort', 'fracengine']; // 没有排布方向（统一横排），网页也不切块
 // 物品类别色条（游戏物品类型）：原矿、材料、组件、成品、物流、生产设施、防御、黑雾、矩阵
 const CAT_COLOR = { 1: '#9aa5b1', 2: '#6f8fb3', 3: '#5f9b8b', 4: '#b48b52', 5: '#7c80c0', 6: '#4f7cc9', 8: '#b56262', 9: '#b56262', 10: '#707070', 11: '#9a72cf' };
@@ -182,6 +182,10 @@ function loadSettings() {
   // 旧版本存的是物品名和逗号分隔的外部供应
   // 新配方：{ 物品 ID: 配方 ID }，只记开了新配方的物品
   state.recipes = s.recipes && typeof s.recipes === 'object' ? Object.fromEntries(Object.entries(s.recipes).filter(([, v]) => Number(v) > 0)) : {};
+  // 珍奇默认用上（rare，worker.js 的 withRare）：新来的默认开；以前存过设置的没这一项，照旧不用（排惯了的线不变），弹窗里自己开。
+  // rareOff 是关掉的物品（照默认配方、有机晶体照常在产线里做），换目标也记着
+  state.rare = Object.keys(s).length ? s.rare === true : true;
+  state.rareOff = Array.isArray(s.rareOff) ? [...new Set(s.rareOff.map(Number).filter((n) => n > 0))] : [];
   delete state.burn; // 「就地烧掉」已经删了，旧设置里的不认
   delete state.proslot; // 没有「增产剂格」选项了，喷增产剂就留一格
   delete state.sorterstack; // 「集装分拣器往带上叠几层」换成了按科技等级选（pilertech），旧键不认
@@ -617,7 +621,7 @@ document.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('cli
 function requestChain() {
   if (!state.targets.every((t) => byId.get(t.id))) return;
   readOptions();
-  send({ type: 'chain', id: ++chainId, params: { targets: state.targets.map((t) => ({ target: t.id, rate: t.rate > 0 ? t.rate : 60 })), raw: [...state.ext], recipes: { ...state.recipes }, lab: state.lab, labStack: state.labstack } });
+  send({ type: 'chain', id: ++chainId, params: { targets: state.targets.map((t) => ({ target: t.id, rate: t.rate > 0 ? t.rate : 60 })), raw: [...state.ext], recipes: { ...state.recipes }, ...rareParams(), lab: state.lab, labStack: state.labstack } });
 }
 function openExt() {
   extFocus = null;
@@ -1047,12 +1051,34 @@ function renderExt() {
 // 后面是不用珍奇的新配方（空间翘曲器（高级），重氢是目标时的重氢分馏），写配方名，图标是它特有的原料，下面一行配方
 const RAW_LIKE = [1117, 1120, 1121, 1116]; // 有机晶体、氢、重氢、硫酸
 const FRAC_RECIPE = 115; // 重氢分馏（分馏塔阵列），worker.js
+// 珍奇默认用上（worker.js 的 withRare）：后台给没自己选过的物品换上用珍奇的配方、把有机晶体设成外部供应，页面不记这些；
+// 玩家关掉的物品记进 state.rareOff，后台就照默认的来。量产计算器带过来的方案照那边选的配方，不再换
+const RARE_RAW = 1117; // 有机晶体：默认外部供应，关掉是在产线里做
+const rareParams = () => ({ rare: state.rare && !handoff, rareOff: [...state.rareOff] });
+const rareOffAdd = (id) => {
+  if (!state.rareOff.includes(Number(id))) state.rareOff.push(Number(id));
+};
+const rareOffDrop = (id) => (state.rareOff = state.rareOff.filter((x) => x !== Number(id)));
+/** 这种物品现在是不是外部供应：自己设的，或珍奇默认设的（后台最近一次说的，关掉过的不算） */
+const extOn = (name) => state.ext.has(name) || (name === byId.get(RARE_RAW)?.name && !state.rareOff.includes(RARE_RAW) && !!(chainData?.autoExt ?? forecastData?.autoExt)?.includes(name));
+/** 设成 / 取消外部供应；取消的是有机晶体时记下关掉了，后台不再默认设 */
+function setExt(name, on) {
+  const rare = name === byId.get(RARE_RAW)?.name;
+  if (on) {
+    state.ext.add(name);
+    if (rare) rareOffDrop(RARE_RAW);
+  } else {
+    state.ext.delete(name);
+    if (rare) rareOffAdd(RARE_RAW);
+  }
+}
 function recipeGroups(d) {
   const goals = new Set(d.goals.map((g) => g.id));
   const groups = new Map();
   for (const x of d.recipes || [])
     for (const a of x.alts) {
       if (a.id === FRAC_RECIPE && !goals.has(x.id)) continue; // 重氢不是目标时分馏就是让重氢走外部供应，用「重氢」那张卡
+      if (a.ore && !a.main) continue; // 珍奇配方顺带出的（石墨烯（高效）的氢）不跟着开：网页的计算不拿副产物抵需要，会多出几倍石墨烯
       const key = a.ore ? `ore${a.ore.id}` : `r${a.id}`;
       if (!groups.has(key)) groups.set(key, { ore: a.ore, icon: a.key, name: a.ore ? a.ore.name : a.name, line: a.line, uses: [] });
       groups.get(key).uses.push({ item: x.id, name: x.name, recipe: a.id, recipeName: a.name, line: a.line, def: x.def, on: x.chosen === a.id });
@@ -1078,7 +1104,7 @@ function renderRecipes(d) {
   const recipeCard = (g) => {
     const on = g.uses.every((u) => u.on);
     const what = g.uses.map((u) => `${u.name}改用「${u.recipeName}」（${u.line}）`).join('；');
-    return card(`data-uses="${g.uses.map((u) => `${u.item}:${u.recipe}`).join(',')}"`, on, `${g.ore ? `${g.name}：` : ''}${what}。点击${on ? '改回默认配方' : '开启'}`, g.icon, g.name, g.ore ? users(g.uses.map((u) => u.item)) : `<span class="rc-line">${esc(g.line)}</span>`);
+    return card(`data-uses="${g.uses.map((u) => `${u.item}:${u.recipe}`).join(',')}"${g.ore ? ' data-rare' : ''}`, on, `${g.ore ? `${g.name}：` : ''}${what}。点击${on ? '改回默认配方' : '开启'}`, g.icon, g.name, g.ore ? users(g.uses.map((u) => u.item)) : `<span class="rc-line">${esc(g.line)}</span>`);
   };
   const rawCard = (u) => {
     const on = u.state === 'external';
@@ -1094,22 +1120,24 @@ function renderRecipes(d) {
 $('ext-recipes').addEventListener('click', (e) => {
   const b = e.target.closest('button.rc');
   if (!b) return;
+  const on = b.getAttribute('aria-pressed') === 'true';
   if (b.dataset.ext != null) {
     // 原矿那几样：设成 / 取消外部供应；重氢开着分馏（不是目标时就是外部供应）的，关掉时一起关
     const name = b.dataset.ext;
-    const on = b.getAttribute('aria-pressed') === 'true';
-    if (on) {
-      state.ext.delete(name);
-      if (name === '重氢' && Number(state.recipes[1121]) === FRAC_RECIPE) delete state.recipes[1121];
-    } else state.ext.add(name);
+    setExt(name, !on);
+    if (on && name === '重氢' && Number(state.recipes[1121]) === FRAC_RECIPE) delete state.recipes[1121];
     $('suggest').hidden = true;
   } else {
-    // 珍奇和新配方：这几样都开着就都关掉，不然都开
+    // 珍奇和新配方：这几样都开着（卡片亮着，含珍奇默认开的）就都关掉，不然都开；关掉珍奇记下，后台不再默认开
     const pairs = b.dataset.uses.split(',').map((p) => p.split(':').map(Number));
-    const allOn = pairs.every(([item, r]) => Number(state.recipes[item]) === r);
     for (const [item, r] of pairs) {
-      if (allOn) delete state.recipes[item];
-      else state.recipes[item] = r;
+      if (on) {
+        delete state.recipes[item];
+        if (b.dataset.rare != null) rareOffAdd(item);
+      } else {
+        state.recipes[item] = r;
+        rareOffDrop(item);
+      }
     }
   }
   saveSettings();
@@ -1289,8 +1317,7 @@ $('tiers').addEventListener('click', (e) => {
   const b = e.target.closest('.xt');
   if (!b || b.getAttribute('aria-disabled') === 'true') return;
   const name = b.dataset.name;
-  if (state.ext.has(name)) state.ext.delete(name);
-  else state.ext.add(name);
+  setExt(name, !extOn(name));
   extAnchor = anchorOf(b);
   $('suggest').hidden = true;
   saveSettings();
@@ -1341,9 +1368,12 @@ function renderExtChips() {
   if (!forecastData && catalog.length && state.targets.every((t) => byId.get(t.id))) return ($('ext-list').innerHTML = '');
   const inChain = forecastData?.chainItems ? new Set(forecastData.chainItems) : null;
   const used = forecastData?.supplied ? new Set(forecastData.supplied) : null; // 设了外部供应、可现在没人用的（只有硫酸用精炼油、硫酸也设了）不列
-  const ext = [...state.ext].filter((n) => (!inChain || inChain.has(catalog.find((c) => c.name === n)?.id)) && (!used || used.has(n)));
-  const alts = Object.keys(state.recipes)
-    .filter((id) => !inChain || inChain.has(Number(id)))
+  // 珍奇默认的（后台说的）一起列，刚关掉、后台还没回话的不列
+  const autoExt = (forecastData?.autoExt ?? []).filter(() => !state.rareOff.includes(RARE_RAW));
+  const autoRecipes = (forecastData?.autoRecipes ?? []).filter((id) => !state.rareOff.includes(id));
+  const ext = [...new Set([...state.ext, ...autoExt])].filter((n) => (!inChain || inChain.has(catalog.find((c) => c.name === n)?.id)) && (!used || used.has(n)));
+  const alts = [...new Set([...Object.keys(state.recipes).map(Number), ...autoRecipes])]
+    .filter((id) => !inChain || inChain.has(id))
     .map((id) => byId.get(Number(id)))
     .filter(Boolean)
     .map((x) => `<li class="rc-on">${pic(x)}${esc(x.name)}：新配方<button type="button" data-recipe-off="${x.id}" aria-label="${esc(x.name)} 改回默认配方">×</button></li>`);
@@ -1433,13 +1463,14 @@ $('ext-list').addEventListener('click', (e) => {
   const off = e.target.closest('button[data-recipe-off]');
   if (off) {
     delete state.recipes[off.dataset.recipeOff];
+    rareOffAdd(off.dataset.recipeOff); // 有珍奇配方的物品不然又默认换回去；别的物品记着也不碍事
     saveSettings();
     renderSpec();
     return;
   }
   const b = e.target.closest('button[data-ext]');
   if (!b) return;
-  state.ext.delete(b.dataset.ext);
+  setExt(b.dataset.ext, false);
   saveSettings();
   renderSpec();
 });
@@ -1573,7 +1604,7 @@ $('preview-tabs').addEventListener('click', (e) => {
 
 /** 页面设置 → 后台的 params（生成和预告共用；生成时另加 again） */
 function buildParams() {
-  const params = { targets: state.targets.map((t) => ({ target: t.id, rate: t.rate })), raw: [...state.ext], recipes: { ...state.recipes } };
+  const params = { targets: state.targets.map((t) => ({ target: t.id, rate: t.rate })), raw: [...state.ext], recipes: { ...state.recipes }, ...rareParams() };
   for (const name of OPTION_NAMES) params[name] = state[name];
   params.stationPrefs = state.stationPrefs; // 翘曲器格、增产剂格改过的设置（物流站简介里改的，出蓝图照这个设）
   params.orient = 'h';

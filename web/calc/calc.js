@@ -138,7 +138,9 @@ const BASE = {
   spray: { level: 0, mode: 'extra' },
   sprayOf: {},
   belt: 2,
-  rare: {}, // 左栏点过的珍奇矿：{ 珍奇: true 这个星球有 / false 没有 }，没点过的照默认配方
+  // 左栏的珍奇矿：{ 珍奇: true 这个星球有 / false 没有 }，没写的照默认配方。新页面默认都有（新手不用先懂珍奇），没有的自己点掉；
+  // 以前存下的页面照存的来（没点过的还是默认配方）
+  rare: Object.fromEntries(RARE.map((n) => [n, true])),
   pick: [], // 清单里点选、要做进蓝图的物品（它用到的跟着一起做）。一开始一样都没选，两个生成按钮点不了
 };
 let tabs = []; // [{ id, name, state }]，第一个是「总页面」（别的页面归档时目标并进这里），不能删
