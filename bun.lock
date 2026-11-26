@@ -5,7 +5,7 @@
     "": {
       "name": "dsp-handcraft-rev",
       "dependencies": {
-        "pako": "^2.1.0",
+        "pako": "3.0.3",
         "react": "^19.3.1",
         "react-dom": "^19.3.1",
       },
@@ -230,7 +230,7 @@
 
     "oxlint-tsgolint": ["oxlint-tsgolint@7.0.2007", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/oxlint-tsgolint/-/oxlint-tsgolint-7.0.2007.tgz", { "optionalDependencies": { "@oxlint-tsgolint/darwin-arm64": "7.0.2007", "@oxlint-tsgolint/darwin-x64": "7.0.2007", "@oxlint-tsgolint/linux-arm64": "7.0.2007", "@oxlint-tsgolint/linux-x64": "7.0.2007", "@oxlint-tsgolint/win32-arm64": "7.0.2007", "@oxlint-tsgolint/win32-x64": "7.0.2007" }, "bin": { "tsgolint": "./bin/tsgolint.js" } }, "sha512-i8X2qf6VVqFzoNVP34joMKuZpO6T2uXMOgKJaSPFc6p+E3FTnbIGPRbI8K4ZApmtDTMu2CIeGfpzeK1zzGwfnA=="],
 
-    "pako": ["pako@2.2.0", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/pako/-/pako-2.2.0.tgz", {}, "sha1-JGudTIQajTCOSEwNA3hmUbFD5jo="],
+    "pako": ["pako@3.0.3", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/pako/-/pako-3.0.3.tgz", {}, "sha512-tmrebBBYI5FOw8QICGwJNqE8fotC8R+gwcxOvoFNv+GKehOI6Lc6YBolNcQNnC4v96l1wt7rh102ifD4kVeZAQ=="],
 
     "picomatch": ["picomatch@4.0.7", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/picomatch/-/picomatch-4.0.7.tgz", {}, "sha1-YxM2ADTMs2s9xh7L3/eBIfkP4h8="],
 

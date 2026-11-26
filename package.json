@@ -15,7 +15,7 @@
     "dev": "bun web/dev.ts"
   },
   "dependencies": {
-    "pako": "^2.1.0",
+    "pako": "3.0.3",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },
