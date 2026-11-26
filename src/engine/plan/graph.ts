@@ -52,12 +52,15 @@ export function buildGraph(calc: Calculation): Graph {
   }
   const byKey = (from: string | null, itemId: number) =>
     byKeys.get(`${from}:${itemId}`) ?? BYPRODUCT + itemId
+  const ordinaryOutputs = new Set(
+    calc.flows.filter((f) => !f.byproduct).map((f) => `${f.from}:${f.itemId}`),
+  )
   const groups = calc.units.map((u, i): Group => {
-    const f = factory(u.factoryId, calc.latitude)
+    const f = factory(u.factoryId, calc.latitude, u.recipeId)
     if (!f.supported || !plannable(u.recipeId, u.factoryId)) {
       const e = Object.assign(
         new Error(
-          `「${u.item}」需要${f.name}（${u.recipe}），目前只能排熔炉、制造台、化工厂、研究站、粒子对撞机和精炼厂的等离子精炼。可以把它设为外部供应。`,
+          `「${u.item}」需要${f.name}（${u.recipe}），布局器暂时不支持这种工厂或配方，可以把它设为外部供应。`,
         ),
         { item: u.item, code: 'UNSUPPORTED_FACTORY' },
       )
@@ -88,7 +91,10 @@ export function buildGraph(calc: Calculation): Graph {
     // 产物：主产物 + 副产物（副产物在生产图里的编号是 BYPRODUCT + 真实编号，单独一条带；别的组也出这种副产物时见上面 byKey）
     // 和主产物一起供产线的（u.shared，同一道配方被几种物品同时选中，calculator.js）也是正经产物
     const outputs = r.outputs.map((o) => ({
-      itemId: o.id === u.itemId || u.shared?.includes(o.id) ? o.id : byKey(u.id, o.id),
+      itemId:
+        o.id === u.itemId || u.shared?.includes(o.id) || ordinaryOutputs.has(`${u.id}:${o.id}`)
+          ? o.id
+          : byKey(u.id, o.id),
       perFactory: rateOf(o),
     }))
     const sideItem = sideItemOf(f, r, u, calc.flows)
@@ -118,6 +124,7 @@ export function buildGraph(calc: Calculation): Graph {
       slotPos: f.slotPos ?? null,
       collider: f.collider,
       colliderShift: f.colliderShift,
+      ...(f.yaw ? { yaw: f.yaw } : null),
       ...(f.latitude ? { latitude: f.latitude } : null), // 化工厂、量子化工厂、精炼厂按哪套间距排：high 加宽、equator 赤道压缩
       levels,
       levelZ: f.levelZ ?? 0,
@@ -156,35 +163,80 @@ export function buildGraph(calc: Calculation): Graph {
   }
   for (const fl of calc.flows) {
     const f = flowOf(fl.itemId, fl.byproduct, fl.from)
-    f.producer = fl.from // 组 ID 或 'RAW'
-    f.consumers.push({ to: fl.to, rate: fl.rate }) // 组 ID 或 'OUT'
+    if (fl.from !== 'RAW') {
+      const group = byId.get(fl.from)
+      if (!group) throw new Error(`物品「${f.name}」的生产组缺失：${fl.from}`)
+      const perFactory =
+        group.outputs.find((o) => o.itemId === f.itemId)?.perFactory ?? group.perFactory
+      if (fl.from === f.producer) f.perFactory = perFactory
+      else {
+        if (f.producer === 'RAW') throw new Error(`「${f.name}」目前不能混用外供和自产`)
+        f.producerRates ??= new Map([[f.producer, f.perFactory!]])
+        f.producerRates.set(fl.from, perFactory)
+      }
+    } else if (f.producer !== 'RAW') {
+      throw new Error(`「${f.name}」目前不能混用外供和自产`)
+    }
+    const consumer = f.consumers.find(({ to }) => to === fl.to)
+    if (consumer) consumer.rate += fl.rate
+    else f.consumers.push({ to: fl.to, rate: fl.rate })
     f.rate += fl.rate
   }
-  for (const f of items.values()) {
-    if (f.producer !== 'RAW' && !byId.has(f.producer))
-      throw new Error(`物品「${f.name}」的生产组缺失`)
-    // 每台生产者往这条带上放多少（主产物、副产物各不相同）
-    if (f.producer !== 'RAW')
-      f.perFactory =
-        byId.get(f.producer)!.outputs.find((o) => o.itemId === f.itemId)?.perFactory ??
-        byId.get(f.producer)!.perFactory
-  }
-  return { groups, byId, items, target: calc.targetId }
+  const edges = calc.flows.map(({ itemId, from, to, rate }) => ({
+    itemId: realItem(itemId),
+    from,
+    to,
+    rate,
+  }))
+  return { groups, byId, edges, items, target: calc.targetId }
 }
 
-/** 最长路径分层：原料层为 0，配方组的层 = 其输入生产者的最大层 + 1 */
-export function layers(graph: Graph): Map<string, number> {
-  const layer = new Map<string, number>()
-  const visit = (g: Group): number => {
-    if (layer.has(g.id)) return layer.get(g.id)!
-    let l = 0
-    for (const inp of g.inputs) {
-      const p = graph.items.get(inp)?.producer
-      if (p && p !== 'RAW') l = Math.max(l, visit(graph.byId.get(p)!) + 1)
-    }
-    layer.set(g.id, l)
-    return l
+/** 给回流组分同一层；只在强连通分量之间计算最长依赖路径。 */
+export function layers({ groups, edges }: Pick<Graph, 'groups' | 'edges'>): Map<string, number> {
+  const upstream = new Map(groups.map(({ id }) => [id, new Set<string>()]))
+  for (const { from, to } of edges) {
+    if (from === 'RAW' || to === 'OUT' || from === to) continue
+    const sources = upstream.get(to)
+    if (!sources || !upstream.has(from)) throw new Error(`物流边的生产组缺失：${from} → ${to}`)
+    sources.add(from)
   }
-  graph.groups.forEach(visit)
+
+  // Tarjan：合并相互依赖的生产组。用入边遍历，使上游分量先出栈。
+  const indices = new Map<string, number>()
+  const stack: string[] = []
+  const active = new Set<string>()
+  const layer = new Map<string, number>()
+  function visit(id: string): number {
+    const index = indices.size
+    indices.set(id, index)
+    stack.push(id)
+    active.add(id)
+    let low = index
+    for (const source of upstream.get(id)!) {
+      const seen = indices.get(source)
+      if (seen === undefined) low = Math.min(low, visit(source))
+      else if (active.has(source)) low = Math.min(low, seen)
+    }
+    if (low !== index) return low
+
+    const members: string[] = []
+    let member: string
+    do {
+      member = stack.pop()!
+      active.delete(member)
+      members.push(member)
+    } while (member !== id)
+
+    let depth = 0
+    for (const group of members) {
+      for (const source of upstream.get(group)!) {
+        const sourceDepth = layer.get(source)
+        if (sourceDepth !== undefined) depth = Math.max(depth, sourceDepth + 1)
+      }
+    }
+    for (const group of members) layer.set(group, depth)
+    return low
+  }
+  for (const { id } of groups) if (!indices.has(id)) visit(id)
   return layer
 }

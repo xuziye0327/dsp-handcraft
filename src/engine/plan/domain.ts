@@ -51,6 +51,7 @@ export interface Group extends Pick<
   | 'collider'
   | 'colliderShift'
   | 'latitude'
+  | 'yaw'
 > {
   id: string
   letter: string
@@ -85,10 +86,18 @@ export interface ItemFlow {
   consumers: { to: string; rate: number }[]
   rate: number
   perFactory?: number
+  producerRates?: Map<string, number> // 多个生产组共用一条物品线路时，各组的单台产量
+}
+export interface LogisticsEdge {
+  itemId: number
+  from: string // 生产组 ID 或 RAW
+  to: string // 消费组 ID 或 OUT；允许和 from 相同
+  rate: number
 }
 export interface Graph {
   groups: Group[]
   byId: Map<string, Group>
+  edges: LogisticsEdge[]
   items: Map<number, ItemFlow>
   target: number
 }
@@ -318,7 +327,7 @@ export interface Layout {
   legs: Leg[]
   ports: Port[]
   chains: Chain[]
-  sides: Map<string, Record<Side, Map<number, IO>>>
+  sides: Map<string, Record<Side, Set<number>>> // 负轨道 ID 为进料，正轨道 ID 为出料
   width: number
   height: number
   area: number

@@ -72,6 +72,7 @@ export interface FactoryGeometry {
   supported: boolean
   levelZ?: number
   tap?: number
+  yaw?: number
 }
 export interface Factory extends FactoryGeometry {
   id: number
@@ -294,7 +295,7 @@ const FACTORY_GEOMETRY: Record<Exclude<FactoryKind, 'store'>, FactoryGeometry> =
     supported: true,
   },
   // 原油精炼厂（实测，game-rules 第 32 条）：两台中心隔 3 并排能放；北边没有口，只接下侧那条通道（长 1 的分拣器接中心下 4 格的带）。
-  // 碰撞体按 2.8 × 5.6、往南偏 0.4（北到 +2.4、南到 −3.2）。卫星配电站另见 substationPad。只排等离子精炼（REFINERY_RECIPES）
+  // 碰撞体按 2.8 × 5.6、往南偏 0.4（北到 +2.4、南到 −3.2）。四口配方的几何由 factory() 旋转。
   refinery: {
     pitch: 3,
     center: 1,
@@ -448,7 +449,7 @@ const FACTORY_KIND: Record<number, FactoryKind> = {
  * 这里默认 'equator' 是工厂本来的几何（独立检查、体积测试按碰撞体查，和间距无关）；规划默认用哪套看 calculate() 的 latitude。
  * 这三种的返回值带 latitude，说明这次按哪套间距排。
  */
-export function factory(id: number, latitude = 'equator'): Factory {
+export function factory(id: number, latitude = 'equator', recipeId?: number): Factory {
   const kind = FACTORY_KIND[id]
   if (!kind) throw new Error(`未知工厂 ID ${id}`)
   const it = item(id)
@@ -457,6 +458,29 @@ export function factory(id: number, latitude = 'equator'): Factory {
     kind === 'store'
       ? STORE_GEOMETRY[id]
       : { ...FACTORY_GEOMETRY[kind], ...GEOMETRY_BY_ID[id], ...high }
+  // 四口精炼配方横放：东西两侧的槽位转到南北通道，各有三个接口。
+  if (kind === 'refinery' && recipeId != null && RECYCLE_REFINERY_RECIPES.has(recipeId)) {
+    const slotPos: NonNullable<FactoryGeometry['slotPos']> = {}
+    for (const [slot, [x, y]] of Object.entries(geo.slotPos!)) slotPos[Number(slot)] = [y, -x]
+    const [w, h] = geo.collider
+    const [dx, dy] = geo.colliderShift ?? [0, 0]
+    Object.assign(geo, {
+      yaw: 90,
+      pitch: high ? 8 : 7,
+      center: 3,
+      trailing: 0,
+      bodyWidth: 7,
+      bodyBelow: 1,
+      bodyAbove: 1,
+      edgeBelow: 1,
+      edgeAbove: 1,
+      edgeShiftBelow: 0,
+      slots: { bottom: { [-1]: 0, 0: 1, 1: 2 }, top: { [-1]: 5, 0: 4, 1: 3 } },
+      slotPos,
+      collider: [h, w],
+      colliderShift: [dy, -dx],
+    } satisfies Partial<FactoryGeometry>)
+  }
   return {
     id,
     name: it.name,
@@ -674,7 +698,7 @@ export function powerHugs(powerItemId: number, g: { kind: string; levels?: numbe
  * margin 独立检查里配电站 3×3 和工厂碰撞体之间至少要隔的距离 { left, right, below, above }（按工厂自己的朝向，紧贴能放的为 0）。
  * 熔炉、制造台、单层研究站可以贴（pad 都是 0，margin 为 null）。
  */
-export function substationPad(g: { kind: string; levels?: number }) {
+export function substationPad(g: { kind: string; levels?: number; yaw?: number }) {
   // 化工厂左边、下沿紧贴撞，别的方向能贴；叠层研究站右边、上面紧贴和斜角都撞（单层能贴），四周都留；
   // 对撞机右边、上面隔 1 格能放，左边、下面隔 1 格还撞（按隔 2 留，隔 2 没量，推断）
   if (g.kind === 'chemical')
@@ -695,7 +719,7 @@ export function substationPad(g: { kind: string; levels?: number }) {
   // 原油精炼厂左右、北边隔 1 格还撞、隔 2 格能放，南边（有口那头）紧贴撞、隔 1 行能放，四个角跟着留
   if (g.kind === 'refinery')
     return {
-      pad: { left: 2, right: 2, below: 1, above: 2 },
+      pad: { left: 2, right: 2, below: g.yaw ? 2 : 1, above: 2 },
       margin: { left: 1.5, right: 1.5, below: 1, above: 1.5 },
     }
   if (g.kind === 'smelter' || g.kind === 'assembler' || g.kind === 'lab')
@@ -1019,8 +1043,8 @@ const STORE_GEOMETRY: Record<number, FactoryGeometry> = {
 }
 /** 液体（同一份物品表的 IsFluid）：箱子供货时用储液罐直接接带，不用储物仓 */
 export const FLUIDS = new Set([1000, 1007, 1114, 1116, 1120, 1121]) // 水、原油、精炼油、硫酸、氢、重氢
-/** 精炼厂只排等离子精炼：X 射线裂解、重整精炼的原料里有自己的产物，排不了 */
-const REFINERY_RECIPES = new Set([16])
+export const RECYCLE_REFINERY_RECIPES = new Set([58, 121])
+const REFINERY_RECIPES = new Set([16, ...RECYCLE_REFINERY_RECIPES])
 const kindOk = (factoryId: number, recipeId: number) => {
   const kind = FACTORY_KIND[factoryId]
   return (
@@ -1030,7 +1054,7 @@ const kindOk = (factoryId: number, recipeId: number) => {
   )
 }
 const isSupported = (r: Recipe) => r.factories.some((f) => kindOk(f, r.id))
-/** 这道配方在这种工厂里能不能排（储物仓这类按几何表；精炼厂只认等离子精炼） */
+/** 这道配方在这种工厂里是否有可用的布局几何。 */
 export const plannable = (recipeId: number, factoryId: number) =>
   FACTORY_KIND[factoryId] === 'store' ? true : kindOk(factoryId, recipeId)
 /**
@@ -1045,11 +1069,11 @@ export function defaultRecipe(itemId: number): Recipe | null {
     .sort((a, b) => a.id - b.id)
   const self = (r: Recipe) => r.inputs.some((x) => x.id === itemId)
   const one = all.find((r) => r.outputs.length === 1)
-  if (one && self(one)) return recipeChoices(itemId)[0] ?? null
+  if (one && self(one)) return recipeChoices(itemId).find((r) => !self(r)) ?? null
   return one ?? all.find((r) => isSupported(r) && !self(r)) ?? null
 }
 /**
- * 一种物品可选的配方：类型不是「无中生有」、这种物品是第一个产物、工厂能排、原料里没有它自己。
+ * 一种物品可选的配方：类型不是「无中生有」、这种物品可以作为产物、工厂能排。回流配方需要显式选择。
  * 化工厂、精炼厂带副产物的配方里这种物品排在后面的也算（比如氢有两种做法，精炼厂的等离子精炼、可燃冰的石墨烯（高效）；
  * 选了它，另一个产物当副产物单独送出）。第一个是默认配方（编号最小的单产物配方），其余是「新配方」（高效、原始等）。
  */
@@ -1062,11 +1086,12 @@ export function recipeChoices(itemId: number): Recipe[] {
       (r) =>
         r.type !== -1 &&
         coProduct(r, itemId) &&
-        !r.inputs.some((x) => x.id === itemId) &&
+        (RECYCLE_REFINERY_RECIPES.has(r.id) || !r.inputs.some((x) => x.id === itemId)) &&
         isSupported(r),
     )
     .sort((a, b) => a.id - b.id)
-  const def = all.find((r) => r.outputs.length === 1) ?? all[0] ?? null // 没有单产物配方时（反物质），带副产物的就是默认
+  const ordinary = all.filter((r) => !RECYCLE_REFINERY_RECIPES.has(r.id))
+  const def = ordinary.find((r) => r.outputs.length === 1) ?? ordinary[0] ?? all[0]
   return def ? [def, ...all.filter((r) => r !== def)] : []
 }
 export const BELT_IDS: Record<number, number> = { 1: 2001, 2: 2002, 3: 2003 }

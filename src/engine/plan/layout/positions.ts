@@ -137,8 +137,10 @@ export function placeBlocks(c: RouteContext) {
     if (!bids) {
       const f = graph.items.get(itemId)!
       bids = []
-      for (let j = -1; j < f.consumers.length; j++) {
-        const list = blocksOf.get(j < 0 ? f.producer : f.consumers[j].to)
+      const groups = new Set(f.producerRates?.keys() ?? [f.producer])
+      for (const { to } of f.consumers) groups.add(to)
+      for (const id of groups) {
+        const list = blocksOf.get(id)
         if (list) for (let i = 0; i < list.length; i++) bids.push(list[i].bid)
       }
       bidsMemo.set(itemId, bids)

@@ -4,10 +4,11 @@ import {
   recipe as recipeOf,
   factory,
   RAW_ITEM_IDS,
+  RECYCLE_REFINERY_RECIPES,
   defaultRecipe,
   SPRAY_LEVELS,
 } from '../gamedata.js'
-import type { Recipe } from '../gamedata.js'
+import type { Factory, Recipe } from '../gamedata.js'
 import { storeUnits } from '../plan/storage.js'
 
 export interface Target {
@@ -49,7 +50,7 @@ export interface ProductionUnit {
   factory: string
   exact: number
   count: number
-  outputRate: number
+  outputRate: number // 主产物总产量，含回流
   levels?: number
   stacks?: number
   labs?: number
@@ -91,6 +92,296 @@ const idOrName = (v: string | number) => (typeof v === 'string' && /^\d+$/.test(
 
 const EPS = 1e-9
 
+type Goal = { item: ReturnType<typeof item>; rate: number }
+type Materials = Pick<Calculation, 'units' | 'raw' | 'byproducts' | 'flows' | 'spray'>
+type SprayLevel = (typeof SPRAY_LEVELS)[number]
+
+function makeUnit(
+  id: string,
+  itemId: number,
+  r: Recipe,
+  f: Factory,
+  exact: number,
+  outputRate: number,
+  spray: ProductionUnit['spray'],
+  labStack: number,
+): ProductionUnit {
+  const unit: ProductionUnit = {
+    id,
+    itemId,
+    item: item(itemId).name,
+    recipeId: r.id,
+    recipe: r.name,
+    factoryId: f.id,
+    factory: f.name,
+    exact,
+    count: Math.ceil(exact - EPS),
+    outputRate,
+    spray,
+  }
+  if (f.kind === 'lab') {
+    const max = Math.max(1, Math.floor(Number(labStack) || 1))
+    unit.stacks = Math.ceil(unit.count / max)
+    unit.levels = Math.ceil(unit.count / unit.stacks)
+    unit.labs = unit.stacks * unit.levels
+    unit.count = unit.stacks
+  }
+  return unit
+}
+
+function amounts(ingredients: Recipe['inputs'], multiplier = 1): Map<number, number> {
+  const counts = new Map<number, number>()
+  for (const { id, count } of ingredients) counts.set(id, (counts.get(id) ?? 0) + count * multiplier)
+  return counts
+}
+
+const isRecycle = (r: Recipe) =>
+  RECYCLE_REFINERY_RECIPES.has(r.id) && r.inputs.some((i) => r.outputs.some((o) => o.id === i.id))
+
+type Source = { unit: ProductionUnit; left: number; used: boolean; total: number; loops: boolean }
+
+// 用可以独立开工的同种产物补回流原料。换下的回流量改供原来的去向，总产耗不变。
+function seedLoops(
+  loops: { flow: Flow; unit: ProductionUnit }[],
+  sources: Map<number, Source[]>,
+  flows: Flow[],
+  external: Set<number>,
+) {
+  const downstream = (from: string) => {
+    const reached = new Set([from])
+    for (const id of reached)
+      for (const f of flows) if (f.rate > EPS && f.from === id && f.to !== 'OUT') reached.add(f.to)
+    return reached
+  }
+  const send = (itemId: number, from: string, to: string, rate: number) => {
+    const flow = flows.find((f) => f.itemId === itemId && f.from === from && f.to === to)
+    if (flow) flow.rate += rate
+    else flows.push({ itemId, from, to, rate })
+  }
+  for (const { flow: loop, unit } of loops) {
+    const { itemId, from: self } = loop
+    if (external.has(itemId)) continue
+    const pool = sources.get(itemId)
+    if (!pool) continue
+    const own = pool.find((s) => s.unit.id === self) ?? {
+      unit,
+      left: 0,
+      total: 0,
+      used: false,
+      loops: true,
+    }
+    for (const source of pool) {
+      if (loop.rate <= EPS) break
+      const from = source.unit.id
+      if (downstream(self).has(from)) continue
+      const exchange = (available: number) => {
+        const rate = Math.min(loop.rate, available)
+        if (rate <= EPS) return 0
+        loop.rate -= rate
+        source.used = true
+        send(itemId, from, self, rate)
+        return rate
+      }
+      const surplus = exchange(source.left)
+      source.left -= surplus
+      own.left += surplus
+      for (const f of flows.slice()) {
+        if (loop.rate <= EPS) break
+        if (f.itemId !== itemId || f.from !== from || f.from === f.to) continue
+        if (downstream(f.to).has(self)) continue
+        const rate = exchange(f.rate)
+        if (rate <= EPS) continue
+        f.rate -= rate
+        send(itemId, self, f.to, rate)
+      }
+    }
+    if (!pool.includes(own) && own.left > EPS) pool.push(own)
+  }
+}
+
+// 只在回流配方进入需求链时合并物料平衡。每种物品仍有一个指定配方，但在产的其他配方也可以补货。
+function recycleMaterials(
+  goals: Goal[],
+  chooseRecipe: (id: number) => Recipe | null,
+  chooseFactory: (r: Recipe) => Factory,
+  external: Set<number>,
+  sprayGoals: Set<number>,
+  eff: SprayLevel,
+  labStack: number,
+): Materials | null {
+  const selected = new Map<Recipe, number[]>()
+  const pending = new Set(goals.map(({ item }) => item.id))
+  const owned = new Set<number>()
+  for (const id of pending) {
+    const r = chooseRecipe(id)
+    if (!r) continue
+    owned.add(id)
+    const ids = selected.get(r)
+    if (ids) {
+      ids.push(id)
+      continue
+    }
+    selected.set(r, [id])
+    const output = amounts(r.outputs)
+    for (const [ingredient, count] of amounts(r.inputs))
+      if (count > (output.get(ingredient) ?? 0)) pending.add(ingredient)
+  }
+  if (![...selected.keys()].some(isRecycle)) return null
+
+  const processes = [...selected].map(([r, ids]) => {
+    const fed = eff && ids.some((id) => sprayGoals.has(id)) && r.inputs.length > 0
+    const spray = fed
+      ? r.proliferator & 2
+        ? ({ mode: 'extra', outMul: 1 + eff.extra, speedMul: 1 } as const)
+        : r.proliferator & 1
+          ? ({ mode: 'speed', outMul: 1, speedMul: 1 + eff.speed } as const)
+          : null
+      : null
+    const inputs = amounts(r.inputs)
+    const outputs = amounts(r.outputs, spray?.outMul ?? 1)
+    const net = new Map(outputs)
+    for (const [id, count] of inputs) net.set(id, (net.get(id) ?? 0) - count)
+    return { r, ids, inputs, outputs, net, spray, crafts: 0 }
+  })
+  const requested = new Map<number, number>()
+  for (const { item, rate } of goals) requested.set(item.id, (requested.get(item.id) ?? 0) + rate)
+
+  // 以净产量算开工量：每组只补自己负责的物品的缺口，多产物取最大值。
+  // 供需互相影响（如裂解吃精炼油、等离子精炼又补氢），同时更新并加阻尼以吸收往复波动。
+  const tolerance = (rate: number) => Math.max(EPS / 100, Math.abs(rate) * Number.EPSILON * 16)
+  let settled = false
+  for (let round = 0; round < 2048 && !settled; round++) {
+    const unmet = new Map(requested)
+    for (const { net, crafts } of processes)
+      for (const [id, count] of net) {
+        if (count > 0 && external.has(id)) continue
+        unmet.set(id, (unmet.get(id) ?? 0) - count * crafts)
+      }
+    settled = true
+    for (const p of processes) {
+      const next = Math.max(
+        0,
+        ...p.ids.map((id) => p.crafts + (unmet.get(id) ?? 0) / p.net.get(id)!),
+      )
+      if (!Number.isFinite(next) || Math.abs(next - p.crafts) > tolerance(next)) settled = false
+      p.crafts += (next - p.crafts) / 2
+    }
+  }
+  if (!settled) throw new Error('回流配方无法平衡：请检查配方组合，或将缺少来源的物品设为外部供应。')
+
+  const units: ProductionUnit[] = []
+  const raw = new Map<number, number>()
+  const byproducts: Calculation['byproducts'] = []
+  const flows: Flow[] = []
+  const sources = new Map<number, Source[]>()
+  const loops: { flow: Flow; unit: ProductionUnit }[] = []
+  const inputs: { itemId: number; to: string; rate: number }[] = []
+  const primary = new Set<number>()
+  const sprayed = new Set<number>()
+  let sprayFlow = 0
+  for (const { r, ids, inputs: grossIn, outputs, net, spray, crafts } of processes) {
+    if (crafts <= EPS) continue
+    const id = r.outputs.find((o) => ids.includes(o.id))!.id
+    const f = chooseFactory(r)
+    if (f.speed == null) throw new Error(`「${f.name}」不能生产「${r.name}」`)
+    const exact = (crafts * r.time) / (60 * f.speed * (spray?.speedMul ?? 1))
+    const unit = makeUnit(
+      `g${units.length}`,
+      id,
+      r,
+      f,
+      exact,
+      crafts * outputs.get(id)!,
+      spray,
+      labStack,
+    )
+    units.push(unit)
+    primary.add(id)
+    for (const [itemId, count] of grossIn) {
+      const loop = Math.min(count, outputs.get(itemId) ?? 0) * crafts
+      if (loop > EPS) {
+        const flow = { itemId, from: unit.id, to: unit.id, rate: loop }
+        flows.push(flow)
+        loops.push({ flow, unit })
+      }
+      if (spray) {
+        sprayed.add(itemId)
+        sprayFlow += count * crafts
+      }
+    }
+    for (const [itemId, count] of net) {
+      const rate = count * crafts
+      if (rate < -EPS) inputs.push({ itemId, to: unit.id, rate: -rate })
+      if (rate > EPS) {
+        if (!sources.has(itemId)) sources.set(itemId, [])
+        sources.get(itemId)!.push({
+          unit,
+          left: rate,
+          total: rate,
+          used: false,
+          loops: grossIn.has(itemId),
+        })
+      }
+    }
+  }
+  const allocate = (itemId: number, to: string, rate: number) => {
+    let left = rate
+    if (!external.has(itemId))
+      for (const source of sources.get(itemId) ?? []) {
+        if (left <= EPS) break
+        const used = Math.min(left, source.left)
+        if (used <= EPS) continue
+        flows.push({ itemId, from: source.unit.id, to, rate: used })
+        source.left -= used
+        source.used = true
+        left -= used
+      }
+    if (left <= Math.max(EPS, tolerance(rate) * 8)) return
+    if (owned.has(itemId)) throw new Error(`回流配方无法平衡：缺少「${item(itemId).name}」。`)
+    raw.set(itemId, (raw.get(itemId) ?? 0) + left)
+    flows.push({ itemId, from: 'RAW', to, rate: left })
+  }
+  for (const { item, rate } of goals) allocate(item.id, 'OUT', rate)
+  for (const { itemId, to, rate } of inputs) allocate(itemId, to, rate)
+  seedLoops(loops, sources, flows, external)
+  for (const [itemId, pool] of sources) {
+    // shared 保留唯一的物品代表；物流的所有来源以 flows 为准。
+    if (!primary.has(itemId)) {
+      const representative = pool.find((s) => s.used)
+      if (representative) (representative.unit.shared ??= []).push(itemId)
+    }
+    for (const { unit, left, used, total, loops } of pool) {
+      if (left <= Math.max(EPS, tolerance(total) * 8)) continue
+      if (used || loops || unit.itemId === itemId) {
+        flows.push({ itemId, from: unit.id, to: 'OUT', rate: left, extra: true })
+      } else {
+        byproducts.push({
+          itemId,
+          item: item(itemId).name,
+          rate: left,
+          from: unit.id,
+          of: unit.itemId,
+        })
+        flows.push({ itemId, from: unit.id, to: 'OUT', rate: left, byproduct: true })
+      }
+    }
+  }
+  return {
+    units,
+    raw: [...raw].map(([itemId, rate]) => ({ itemId, item: item(itemId).name, rate })),
+    byproducts,
+    flows: flows.filter((f) => f.rate > EPS),
+    spray: eff
+      ? {
+          ...eff,
+          rate: sprayFlow / eff.sprays,
+          items: [...sprayed],
+          to: units.filter((u) => u.spray).map((u) => u.id),
+        }
+      : null,
+  }
+}
+
 /**
  * @param {object} o
  * @param {string|number} o.target 目标产物（单目标写法）
@@ -103,7 +394,7 @@ const EPS = 1e-9
  * @param {number} [o.labStack=15] 研究站最多叠几层（垂直建造科技 1~6 级：5/7/9/11/13/15 层，来自 BWIKI）。
  *   研究站的 count 是「叠数」，每叠 levels 层，各叠一样高：需要 n 台、最多叠 m 层时叠数 = ⌈n/m⌉、层数 = ⌈n/叠数⌉
  * @param {Record<string,string|number>} [o.recipes] 指定配方 { 物品名或 ID: 配方名或 ID }；可以是有副产物的配方（如石墨烯高效），
- *   副产物单独算一股流（byproduct），从这组工厂送到出口，不抵产线里同种物品的需求
+ *   普通产线的副产物单独送到出口；有回流时，在产的配方可以用副产物补足同种物品的需求
  * @param {string[]} [o.raw] 额外视为外部供应的物品
  * @param {0|1|2|3} [o.spray=0] 喷增产剂（Mk.I~Mk.III）：只喷最终产物的直接原料，只有最终产物那道吃到——
  *   能增产的按增产（产物 +12.5%/20%/25%），只能加速的按加速（+25%/50%/100%）算（游戏规则：一台工厂的每一种原料都喷到才有效果，
@@ -153,18 +444,70 @@ export function calculate({
       .map(([k, v]) => [item(idOrName(k)).id, recipeOf(idOrName(v))]),
   )
 
-  const chooseRecipe = (itemId: number) => {
+  const chooseRecipe = (itemId: number, recycle = false) => {
     if (extIds.has(itemId)) return null
-    // 选的配方原料里有它自己（精炼油的重整精炼，计算器带过来的也算）：不用，照默认（见 gamedata.js 的 defaultRecipe）
     const o = overrides.get(itemId)
-    // 原矿也能指定配方做（硅石用石矿炼，量产计算器里选了会带过来）；不指定就是开采，从外面来
-    if (o && o.inputs.length && !o.inputs.some((x) => x.id === itemId)) return o
+    // 原矿也能指定配方做（硅石用石矿炼）；不指定就是开采，从外面来。
+    if (o?.inputs.length) {
+      if (isRecycle(o)) {
+        if (recycle && (amounts(o.outputs).get(itemId) ?? 0) > (amounts(o.inputs).get(itemId) ?? 0))
+          return o
+      } else if (
+        !o.inputs.some((x) => x.id === itemId) &&
+        (!recycle || o.outputs.some((x) => x.id === itemId))
+      )
+        return o
+    }
     if (RAW_ITEM_IDS.has(itemId)) return null
-    return defaultRecipe(itemId) // 优先单产物配方；只有带副产物的配方能做时（反物质、精炼油），副产物单独送出
+    return defaultRecipe(itemId)
   }
   const preferred = [smelter, assembler, chemical, lab]
   const chooseFactory = (r: Recipe) =>
     factory(preferred.find((id) => r.factories.includes(id)) ?? r.factories[0])
+  const eff = SPRAY_LEVELS[spray] ?? null
+  const goalIds = new Set(sprayFor ? sprayFor.map(Number) : goals.map((g) => g.item.id))
+  const finish = (materials: Materials): Calculation => {
+    if (!materials.units.length) {
+      const id = targetItem.id
+      const why = extIds.has(id)
+        ? '设成了外部供应'
+        : RAW_ITEM_IDS.has(id)
+          ? '是原矿，直接开采'
+          : '没有能在产线里做的配方'
+      throw new Error(
+        `「${goals.map((g) => g.item.name).join('、')}」${why}，产线里没有要排的工厂。`,
+      )
+    }
+    // target/targetId/rate 保留给单目标的老代码；多目标时 target 是「A+B」，rate 是第一个目标的产量
+    const result: Calculation = {
+      spray: materials.spray,
+      target: goals.map((g) => g.item.name).join('+'),
+      targetId: targetItem.id,
+      rate: goals[0].rate,
+      targets: goals.map((g) => ({ itemId: g.item.id, name: g.item.name, rate: g.rate })),
+      label: goals.map((g) => `${g.item.name}${g.rate}`).join('+'),
+      units: materials.units,
+      raw: materials.raw,
+      byproducts: materials.byproducts,
+      flows: materials.flows,
+      latitude: latitude === 'equator' ? 'equator' : 'high',
+    }
+    return supply
+      ? storeUnits(result, { supply, sorter: storeSorter, maxLayers: storeLayers, belt: storeBelt })
+      : result
+  }
+  if ([...overrides.values()].some(isRecycle)) {
+    const materials = recycleMaterials(
+      goals,
+      (id) => chooseRecipe(id, true),
+      chooseFactory,
+      extIds,
+      goalIds,
+      eff,
+      labStack,
+    )
+    if (materials) return finish(materials)
+  }
 
   // 深度优先得到拓扑序（后序），再逆序传播需求，保证一个物品的需求在展开前已全部累加
   const recipeFor = new Map<number, Recipe | null>()
@@ -185,9 +528,7 @@ export function calculate({
 
   const demand = new Map<number, number>()
   for (const g of goals) demand.set(g.item.id, (demand.get(g.item.id) || 0) + g.rate)
-  const eff = SPRAY_LEVELS[spray] ?? null
   // 只喷最终产物的直接原料；最终产物的配方不吃增产剂（proliferator 为 0）就不喷
-  const goalIds = new Set(sprayFor ? sprayFor.map(Number) : goals.map((g) => g.item.id))
   const canSpray = (r: Recipe | null | undefined): r is Recipe =>
     !!r && r.inputs.length > 0 && (r.proliferator & 3) > 0
   const sprayed = eff
@@ -259,27 +600,17 @@ export function calculate({
     if (f.speed == null) throw new Error(`「${f.name}」不能生产「${r.name}」`)
     const perFactory = (out * 60 * f.speed * speedMul) / r.time
     const exact = need / perFactory
-    const unit: ProductionUnit = {
-      id: `g${units.length}`,
+    const unit = makeUnit(
+      `g${units.length}`,
       itemId,
-      item: item(itemId).name,
-      recipeId: r.id,
-      recipe: r.name,
-      factoryId: f.id,
-      factory: f.name,
+      r,
+      f,
       exact,
-      count: Math.ceil(exact - EPS),
-      outputRate: need,
-      spray: mode ? { mode, outMul, speedMul } : null,
-      ...(ids ? { shared: ids.filter((id) => id !== itemId) } : null),
-    }
-    if (f.kind === 'lab') {
-      const max = Math.max(1, Math.floor(Number(labStack) || 1))
-      unit.stacks = Math.ceil(unit.count / max)
-      unit.levels = Math.ceil(unit.count / unit.stacks)
-      unit.labs = unit.stacks * unit.levels
-      unit.count = unit.stacks
-    }
+      need,
+      mode ? { mode, outMul, speedMul } : null,
+      labStack,
+    )
+    if (ids) unit.shared = ids.filter((id) => id !== itemId)
     units.push(unit)
     // 几种产物都供产线的：比要的多出来的跟着那条带送出
     if (ids)
@@ -302,16 +633,6 @@ export function calculate({
       flows.push({ itemId: inp.id, from: 'RAW', to: unit.id, rate: inRate })
     }
   }
-  // 目标都是原矿、设成了外部供应或没有配方（黑雾掉落这类）：一台工厂都没有，排不出东西
-  if (!units.length) {
-    const id = goals[0].item.id
-    const why = extIds.has(id)
-      ? '设成了外部供应'
-      : RAW_ITEM_IDS.has(id)
-        ? '是原矿，直接开采'
-        : '没有能在产线里做的配方'
-    throw new Error(`「${goals.map((g) => g.item.name).join('、')}」${why}，产线里没有要排的工厂。`)
-  }
   // 回填每条流的来源：生产该物品的配方组，或 'RAW'
   const producerOf = new Map(
     units.flatMap((u) => [u.itemId, ...(u.shared ?? [])].map((id) => [id, u.id] as const)),
@@ -327,21 +648,5 @@ export function calculate({
           to: units.filter((u) => u.spray).map((u) => u.id),
         }
       : null
-  // target/targetId/rate 保留给单目标的老代码；多目标时 target 是「A+B」，rate 是第一个目标的产量
-  const result: Calculation = {
-    spray: sprayInfo,
-    target: goals.map((g) => g.item.name).join('+'),
-    targetId: targetItem.id,
-    rate: goals[0].rate,
-    targets: goals.map((g) => ({ itemId: g.item.id, name: g.item.name, rate: g.rate })),
-    label: goals.map((g) => `${g.item.name}${g.rate}`).join('+'),
-    units,
-    raw: rawSupply,
-    byproducts,
-    flows,
-    latitude: latitude === 'equator' ? 'equator' : 'high',
-  }
-  return supply
-    ? storeUnits(result, { supply, sorter: storeSorter, maxLayers: storeLayers, belt: storeBelt })
-    : result
+  return finish({ units, raw: rawSupply, byproducts, flows, spray: sprayInfo })
 }

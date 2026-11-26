@@ -94,6 +94,7 @@ export function createSupply(context: SupplyContext) {
         if (g.ore) rareOffAdd(u.item)
       } else {
         state.recipes[u.item] = u.recipe
+        if (u.item === RARE_RAW) state.ext.delete(u.name)
         rareOffDrop(u.item)
       }
     }

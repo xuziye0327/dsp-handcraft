@@ -18,6 +18,7 @@ import { rotateBlueprint } from '../emit/rotate.ts'
 import { narrowestEW } from '../gamedata.ts'
 import { POWER, powerReach } from '../plan/power.ts'
 import { compact, collisions } from './compact.ts'
+import { loopYield, maxTowersPerBelt } from './flow.ts'
 import { TEMPLATE } from './template.ts'
 interface LoopInfo {
   key: string
@@ -354,6 +355,25 @@ export function fractionatorArray(
     )
   else if (p.copies > 1) r.notes.unshift(`一座物流站最多带 ${MAX_TOWERS} 座塔（4 个循环）。${split}`)
   return r
+}
+
+/** 产线用稳态产量选塔数，每条收集带都按单层运力核算。 */
+export function steadyArrayPlan(rate: number, spray: number) {
+  const p = SPRAY[spray].p
+  const perTower = perTowerOf(spray)
+  const max = Math.min(TOWERS_PER_LOOP, maxTowersPerBelt(p))
+  for (let towers = 1; towers <= max * LOOPS.length; towers++) {
+    const count = Math.ceil(towers / max)
+    const plan = arrayPlan(towers * perTower, perTower, LOOPS.length, count)
+    const yieldRate = plan.loops.reduce((n, loop) => n + loopYield(loop.towers, p), 0)
+    if (yieldRate >= rate - 1e-9) return { ...plan, rate: yieldRate }
+  }
+  throw new Error(`分馏阵列一个物流站无法供应 ${rate}/分重氢`)
+}
+
+export function integratedArray(rate: number, spray: number) {
+  const plan = steadyArrayPlan(rate, spray)
+  return buildArray(plan, { spray, perTower: plan.perTower, orient: 'v' })
 }
 
 /** 按 plan 裁一份 */

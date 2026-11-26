@@ -4,6 +4,7 @@ import { fromStr } from '../codec/parser.ts'
 import type { Building, BuildingParameters, Point2, Point3 } from '../codec/types.ts'
 import {
   RECIPES,
+  RECYCLE_REFINERY_RECIPES,
   ITEMS,
   factory,
   OVERPASS_ZMAX,
@@ -913,7 +914,7 @@ export function checkBlueprint(str: string, opt: { noTech?: boolean; maxErrors?:
   const fromPiler = new Map<number, Building>() // 集装机 → 它送出的那节带子
   for (const b of belts)
     if (b.inputObjIdx >= 0 && B[b.inputObjIdx]?.itemId === PILER) fromPiler.set(b.inputObjIdx, b)
-  const seed = (b: Building, item: number) => {
+  const seed = (b: Building, item: number, transport = carried) => {
     let cur: Building | null = b
     const seen = new Set<number>()
     while (cur && !seen.has(cur.index)) {
@@ -923,7 +924,7 @@ export function checkBlueprint(str: string, opt: { noTech?: boolean; maxErrors?:
         continue
       }
       if (!isBelt(cur.itemId)) break
-      carried.get(cur.index)!.add(item)
+      transport.get(cur.index)!.add(item)
       cur = cur.outputObjIdx >= 0 ? B[cur.outputObjIdx] : null
     }
   }
@@ -972,12 +973,51 @@ export function checkBlueprint(str: string, opt: { noTech?: boolean; maxErrors?:
       else if (!warnings.includes('有储物仓往带上放料，但没设过滤或配送器，不知道放的是什么'))
         warnings.push('有储物仓往带上放料，但没设过滤或配送器，不知道放的是什么')
     }
-    if (src && BODY[src.itemId] && dst && isBelt(dst.itemId)) {
-      const r = RECIPES.get(src.recipeId)
-      // 带过滤的出料分拣器只拿那一种（有副产物的工厂两根出料各拿各的）
-      if (s.filterId) seed(dst, s.filterId)
-      else for (const o of r?.outputs ?? []) seed(dst, o.id) // 没配方的工厂后面会单独报
+  }
+  const recycleFactories = factories.filter((f) => RECYCLE_REFINERY_RECIPES.has(f.recipeId))
+  const startup = recycleFactories.length
+    ? new Map([...carried].map(([index, items]) => [index, new Set(items)]))
+    : null
+  const feed = new Map<number, number[]>()
+  const deliveries = new Map<number, { belt: Building; items: number[] }[]>()
+  for (const s of sorters) {
+    const src = B[s.inputObjIdx]
+    const dst = B[s.outputObjIdx]
+    if (!src || !dst) continue
+    if (BODY[src.itemId] && isBelt(dst.itemId)) {
+      const items = s.filterId
+        ? [s.filterId]
+        : (RECIPES.get(src.recipeId)?.outputs.map((o) => o.id) ?? [])
+      for (const item of items) seed(dst, item)
+      if (startup) {
+        if (!deliveries.has(src.index)) deliveries.set(src.index, [])
+        deliveries.get(src.index)!.push({ belt: dst, items })
+      }
     }
+    if (startup && isBelt(src.itemId) && BODY[dst.itemId]) {
+      if (!feed.has(dst.index)) feed.set(dst.index, [])
+      feed.get(dst.index)!.push(src.index)
+    }
+  }
+  if (startup) {
+    // 仅从原料入口推进可达性；循环里的工厂要等原料确实能送到才算启动。
+    const waiting = new Set(factories.filter((f) => !stacked(f)))
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const f of waiting) {
+        const r = RECIPES.get(f.recipeId)
+        const sources = feed.get(f.index) ?? []
+        if (!r || r.inputs.some(({ id }) => !sources.some((b) => startup.get(b)?.has(id)))) continue
+        waiting.delete(f)
+        changed = true
+        for (const { belt, items } of deliveries.get(f.index) ?? [])
+          for (const item of items) seed(belt, item, startup)
+      }
+    }
+    for (const f of recycleFactories)
+      if (waiting.has(f))
+        err(`工厂 ${f.index}（${RECIPES.get(f.recipeId)?.name}）从原料入口无法启动`)
   }
   for (const set of carried.values())
     if (set.size > 1) {

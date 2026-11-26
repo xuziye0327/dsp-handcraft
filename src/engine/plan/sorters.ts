@@ -541,7 +541,7 @@ for (const a of [-1, 0, 1]) {
 /**
  * @param graph 生产图
  * @param L route() 的中间结果（需已有 rows、pos、rowBelow、rowAbove、channels、segments）
- * @param sideIo Map<块 ID, {bottom: Map<itemId,'in'|'out'>, top: ...}>
+ * @param sideIo 每块两侧的有向轨道：负 ID 进料，正 ID 出料
  * cache：按通道复用算过的落位（见 SC），只影响速度（route.js 的 DEFAULTS.sorterCache）
  * countOnly：只走收集工厂那一段，数够不着（tooLong）和太慢（slow）各有几条，返回 { nTooLong, nSlow }，不排落位、不做动态规划、不碰缓存
  * （layout/score.js 的 preLegWantFloor）。条数和不带它时 tooLong、slow 的长度一样：同一段代码、同样的输入
@@ -608,7 +608,7 @@ export function assignSorters(
     SC.segPos = grown(SC.segPos, nSeg)
   }
   // 同一通道里同一物品可能有几段（比如原料按运力切开、各开一个入口），优先用把这个块列为接口的那一段
-  const segFor = (itemId: number, ch: number, cx: number, bid: string) => {
+  const segFor = (itemId: number, dir: IO, ch: number, cx: number, bid: string) => {
     if (!(ch >= 0 && ch <= maxCh)) return undefined
     const j0 = segStart[ch]
     const j1 = segStart[ch + 1]
@@ -616,7 +616,7 @@ export function assignSorters(
       const s = segs[segAt[j]]
       if (s.itemId !== itemId || !(s.a <= cx + 1 && s.b >= cx - 1) || !s.taps) continue
       const taps = s.taps
-      for (let t = 0; t < taps.length; t++) if (taps[t].bid === bid) return s
+      for (let t = 0; t < taps.length; t++) if (taps[t].bid === bid && taps[t].io === dir) return s
     }
     for (let j = j0; j < j1; j++) {
       const s = segs[segAt[j]]
@@ -635,14 +635,17 @@ export function assignSorters(
   let ftank = false
   let fextra = 0
   let nW = 0 // 本通道用了 POOL.want 的前几个
-  const wantOf = (dir: IO, itemId: number) => {
-    const seg = segFor(itemId, fc, fcx0, fbid)
+  const wantOf = (signedItem: number) => {
+    const dir = signedItem < 0 ? 'in' : 'out'
+    const itemId = Math.abs(signedItem)
+    const seg = segFor(itemId, dir, fc, fcx0, fbid)
     const track = seg ? seg.track : 0
     const length = (fBelow ? track + 1 : fn - track) + fextra
     // 取料按这一组的消费量（consumers 里第一个是这一组的，没有记 0）
     const it = graph.items.get(itemId)!
     let total = 0
-    if (dir === 'out') total = it.rate
+    if (dir === 'out')
+      total = it.producerRates ? (it.producerRates.get(fgid) ?? 0) * fg.count : it.rate
     else {
       const cons = it.consumers
       for (let j = 0; j < cons.length; j++) {

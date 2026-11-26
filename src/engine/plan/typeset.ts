@@ -116,7 +116,7 @@ export function unitsOf(graph: Graph, caps: Caps = null): Units {
   const beltCap = caps?.beltCap
   if (beltCap)
     for (const it of graph.items.values()) {
-      if (it.producer === 'RAW' || !(it.rate > beltCap + 1e-6)) continue
+      if (it.producer === 'RAW' || it.producerRates || !(it.rate > beltCap + 1e-6)) continue
       const k = Math.ceil(it.rate / beltCap - 1e-9)
       const bin = it.rate / k
       // 各条带实际的流量累计到 edges，消费者按 edges 切。生产者切在第几台：等分点前后 4 台里，挑累计流量正好落在消费者整台边界上的
@@ -228,17 +228,13 @@ function adjacency(graph: Graph) {
   const at = new Map(ids.map((id, i) => [id, i]))
   const n = ids.length
   const A = Array.from({ length: n }, () => new Float64Array(n))
-  for (const f of graph.items.values()) {
-    if (f.producer === 'RAW' || !at.has(f.producer)) continue
-    const i = at.get(f.producer)!
-    for (const c of f.consumers) {
-      if (!at.has(c.to)) continue
-      const j = at.get(c.to)!
-      if (i === j) continue
-      const w = 1 + c.rate / 1800
-      A[i][j] += w
-      A[j][i] += w
-    }
+  for (const { from, to, rate } of graph.edges) {
+    const i = at.get(from)
+    const j = at.get(to)
+    if (i === undefined || j === undefined || i === j) continue
+    const w = 1 + rate / 1800
+    A[i][j] += w
+    A[j][i] += w
   }
   return { ids, A }
 }

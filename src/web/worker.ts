@@ -45,7 +45,20 @@ import { fromStr, toStr } from '../engine/codec/parser.ts'
 import { emitBlueprint, stationSettings, chainTiles } from '../engine/emit/blueprint.ts'
 import { checkBlueprint } from '../engine/emit/check.ts'
 import { annealedArray, annealedEstimate } from '../engine/fractionate/anneal.ts'
-import { fractionatorArray, checkArray, arrayModel, arrayPlan } from '../engine/fractionate/array.ts'
+import {
+  fractionatorArray,
+  checkArray,
+  arrayModel,
+  arrayPlan,
+  steadyArrayPlan,
+} from '../engine/fractionate/array.ts'
+import {
+  DEUTERIUM,
+  FRAC_RECIPE,
+  HYDROGEN,
+  integrateFractionators,
+} from '../engine/fractionate/integrate.ts'
+import type { FractionatorFeed } from '../engine/fractionate/integrate.ts'
 import {
   ITEMS,
   RAW_ITEM_IDS,
@@ -87,7 +100,6 @@ import { validate } from '../engine/plan/validate.ts'
 import { autoWatcher, previewShapeOk } from './autowatch.js'
 import { renderModel, groupLabels } from './model.js'
 
-// 重氢的「分馏塔阵列」：不是普通配方（分馏塔不接分拣器、带子从塔里穿过），选了它就单独生成一张分馏阵列蓝图
 type Recipes = NonNullable<GeneratorParams['recipes']>
 type Rare = { off: number[] } | null
 interface RecipeChoice {
@@ -156,36 +168,30 @@ const messageOf = (e: unknown) => (e instanceof Error ? e.message : String(e))
 const unsupportedItem = (e: unknown) =>
   e && typeof e === 'object' && 'item' in e && typeof e.item === 'string' ? e.item : null
 
-const DEUTERIUM = 1121
-const FRAC_RECIPE = 115
 const FRAC_CHOICE: RecipeChoice = {
   inputs: [],
   outputs: [],
   id: FRAC_RECIPE,
   name: '重氢分馏（分馏塔阵列）',
-  line: '氢 → 重氢，分馏塔阵列，单独一张蓝图',
+  line: '外部氢 → 重氢，分馏塔阵列',
 }
 // 原矿的默认「配方」是开采（从外面来）；有配方能做的（硅石用石矿炼）才在弹窗底部列出来开关
 const MINED: RecipeChoice = { outputs: [], id: null, name: '开采', line: '开采', inputs: [] }
-/**
- * 选了分馏：从配方里拿掉（计算器不认分馏塔），重氢不是目标时当外部供应。
- * 目标不当外部供应：页面记着以前的产线设过的外部供应，这一种又被选成目标时照常在产线里做（同 catalog）
- */
+/** 普通规划器为重氢留进料端；分馏阵列在出蓝图时接入。 */
 function splitFraction(targets: Target[], raw0: string[], recipes: Recipes, rare: Rare = null) {
   const goals = new Set(targets.map((t) => ITEMS.get(Number(t.target))?.name))
   const raw = raw0.filter((n) => !goals.has(n))
-  const on = Number(recipes?.[DEUTERIUM]) === FRAC_RECIPE
-  if (!on) return { on, isGoal: false, ...rareDefaults(targets, raw, recipes || {}, rare) }
+  if (Number(recipes?.[DEUTERIUM]) !== FRAC_RECIPE)
+    return { on: false, isGoal: false, ...rareDefaults(targets, raw, recipes || {}, rare) }
   const rest = { ...recipes }
   delete rest[DEUTERIUM]
+  const name = ITEMS.get(DEUTERIUM)!.name
+  const on = !raw.includes(name)
   const isGoal = targets.some((t) => Number(t.target) === DEUTERIUM)
-  const fracRaw = isGoal || raw.includes('重氢') ? raw : [...raw, '重氢']
   return {
     on,
-    ...(isGoal
-      ? rareDefaults(targets, fracRaw, rest, null)
-      : rareDefaults(targets, fracRaw, rest, rare)),
     isGoal,
+    ...rareDefaults(targets, on && !isGoal ? [...raw, name] : raw, rest, isGoal ? null : rare),
   }
 }
 
@@ -422,6 +428,7 @@ function chain({
   const goalIds = new Set(full.targets.map((t) => t.itemId))
   const curUnits = new Map(withShared(cur).map((u) => [u.itemId, u]))
   const curRaw = new Map(cur.raw.map((r) => [r.itemId, r.rate]))
+  const fractionRate = frac.on && !frac.isGoal ? (curRaw.get(DEUTERIUM) ?? 0) : 0
   const unitByItem = new Map(withShared(full).map((u) => [u.itemId, u]))
   const itemOfUnit = (calc: Calculation) => new Map(calc.units.map((u) => [u.id, u.itemId]))
   const fullOwner = itemOfUnit(full)
@@ -472,7 +479,19 @@ function chain({
     ? []
     : withShared(full)
         .filter((u) => !goalIds.has(u.itemId))
-        .map(describe)
+        .map((u) =>
+          fractionRate && u.itemId === DEUTERIUM
+            ? {
+                ...describe(u),
+                factory: '分馏塔',
+                supported: true,
+                count: fractionTowerEstimate(fractionRate, 0),
+                rate: fractionRate,
+                state: 'line',
+                co: null,
+              }
+            : describe(u),
+        )
   // 依赖边：只连中间产物和目标之间（原矿不在弹窗里）
   const curRate = new Map<string, number>()
   for (const fl of cur.flows)
@@ -486,7 +505,7 @@ function chain({
     const live = curRate.get(key)
     const state =
       live != null
-        ? raw.includes(unitByItem.get(fl.itemId)!.item)
+        ? raw.includes(unitByItem.get(fl.itemId)!.item) && !(fractionRate && fl.itemId === DEUTERIUM)
           ? 'external'
           : 'line'
         : 'dropped'
@@ -494,7 +513,7 @@ function chain({
   }
   // 原料（原矿、黑雾掉落、临界光子这类没有配方的）→ 当前产线里用它的产物，同一对合成一条
   const raws = fracGoal
-    ? [{ itemId: 1120, item: ITEMS.get(1120)!.name, rate: Number(targets[0].rate) }]
+    ? [{ itemId: HYDROGEN, item: ITEMS.get(HYDROGEN)!.name, rate: Number(targets[0].rate) }]
     : cur.raw.filter((r) => !raw.includes(r.item))
   const rawIds = new Set(raws.map((r) => r.itemId))
   const rawEdges = new Map<string, { from: number; to: number; rate: number; state: string }>()
@@ -513,6 +532,12 @@ function chain({
       if (rawEdges.has(key)) rawEdges.get(key)!.rate += fl.rate
       else rawEdges.set(key, { from: fl.itemId, to, rate: fl.rate, state: 'raw' })
     }
+  if (fractionRate) {
+    const hydrogen = raws.find((r) => r.itemId === HYDROGEN)
+    if (hydrogen) raws[raws.indexOf(hydrogen)] = { ...hydrogen, rate: hydrogen.rate + fractionRate }
+    else raws.push({ itemId: HYDROGEN, item: ITEMS.get(HYDROGEN)!.name, rate: fractionRate })
+    edges.push({ from: HYDROGEN, to: DEUTERIUM, rate: fractionRate, state: 'raw' })
+  }
   edges.push(...rawEdges.values())
   // 同一组工厂一起出的：主产物 → 这种物品，画成副产物那样的点线
   for (const u of withShared(cur))
@@ -543,26 +568,25 @@ function chain({
       ...withShared(full).map((u) => u.itemId),
       ...mined,
     ]
-      .filter(
-        (id, i, a) =>
-          a.indexOf(id) === i &&
-          ((id === DEUTERIUM && frac.on) ||
-            (!fracGoal &&
-              !raw.includes(ITEMS.get(id)!.name) &&
-              (curUnits.has(id) ||
-                mined.includes(id) ||
-                full.targets.some((t) => t.itemId === id)))),
-      )
+      .filter((id, i, a) => {
+        if (a.indexOf(id) !== i) return false
+        if (id === DEUTERIUM && frac.on) return true
+        if (fracGoal) return false
+        const name = ITEMS.get(id)!.name
+        if (id === RARE_RAW && raw.includes(name)) return true
+        return (
+          !raw.includes(name) &&
+          (curUnits.has(id) || mined.includes(id) || full.targets.some((t) => t.itemId === id))
+        )
+      })
       .map((id) => ({
         id,
         name: ITEMS.get(id)!.name,
-        choices: (
-          (id === DEUTERIUM
-            ? [...recipeChoices(id), FRAC_CHOICE]
-            : RAW_ITEM_IDS.has(id)
-              ? [MINED, ...recipeChoices(id)]
-              : recipeChoices(id)) as RecipeChoice[]
-        ).filter((r) => !(r.id != null && UNLISTED_ALTS.has(r.id))),
+        choices: (id === DEUTERIUM
+          ? [...recipeChoices(id), FRAC_CHOICE]
+          : RAW_ITEM_IDS.has(id)
+            ? [MINED, ...recipeChoices(id)]
+            : recipeChoices(id)) as RecipeChoice[],
       }))
       .filter((x) => x.choices.length > 1)
       .map((x) => ({
@@ -601,8 +625,6 @@ function chain({
   }
 }
 
-// 弹窗里不列的新配方（不常用）：有机晶体（原始）。有机晶体在弹窗右栏当珍奇（有矿脉）直接设外部供应
-const UNLISTED_ALTS = new Set([54])
 // 珍奇矿物（游戏里的稀有资源）：新配方那一栏按它们归拢，一种矿只列一次
 const RARE_ORES = new Set([1011, 1012, 1013, 1014, 1015, 1016]) // 可燃冰、金伯利矿石、分形硅石、光栅石、刺笋结晶、单极磁石
 /**
@@ -969,6 +991,99 @@ function madeOf(calc: Calculation) {
   return { parts, supplied }
 }
 
+function fractionTowerEstimate(rate: number, spray: number, cap = 1800) {
+  const copies = Math.ceil(rate / cap)
+  return copies * steadyArrayPlan(rate / copies, spray).towers
+}
+
+function fractionDemand(calc: Calculation) {
+  return (
+    calc.raw.filter((r) => r.itemId === DEUTERIUM).reduce((n, r) => n + r.rate, 0) +
+    calc.units
+      .filter((u) => u.store?.kind === 'in' && baseItem(u.itemId) === DEUTERIUM)
+      .reduce((n, u) => n + u.store!.rate, 0)
+  )
+}
+
+function fractionFeeds(L: Layout): FractionatorFeed[] {
+  const at = (x: number, y: number) => toBlueprint(L, x + (L.origin?.x ?? 0), y + (L.origin?.y ?? 0))
+  return L.chains.flatMap<FractionatorFeed>((chain) => {
+    if (chain.itemId !== DEUTERIUM) return []
+    const leg = L.legs[chain.parts[0]?.leg ?? -1]
+    if (leg?.kind !== 'in') return []
+    if (leg.station) {
+      const st = L.stations![leg.station.k]
+      return [
+        { at: at(st.x, st.y), rate: leg.rate, mode: 'station' as const, slot: leg.station.slot },
+      ]
+    }
+    const [x, y] = chainTiles(L, chain).main[0]
+    return [{ at: at(x, y), rate: leg.rate, mode: 'edge' as const }]
+  })
+}
+
+function fractionModel(model: DrawingModel, result: ReturnType<typeof integrateFractionators>) {
+  const oldWidth = model.width
+  const { x, y } = result.shift
+  if (model.rotated) {
+    model.origin = {
+      x: (model.origin?.x ?? 0) + result.bp.dragBoxSize.y - oldWidth - y,
+      y: (model.origin?.y ?? 0) + x,
+    }
+    model.width = result.bp.dragBoxSize.y
+    model.height = result.bp.dragBoxSize.x
+  } else {
+    model.origin = { x: (model.origin?.x ?? 0) + x, y: (model.origin?.y ?? 0) + y }
+    model.width = result.bp.dragBoxSize.x
+    model.height = result.bp.dragBoxSize.y
+  }
+  const local = (x: number, y: number) =>
+    model.rotated
+      ? { x: model.width - 1 - y - model.origin!.x, y: x - model.origin!.y }
+      : { x: x - model.origin!.x, y: y - model.origin!.y }
+  for (const route of model.routes) if (route.itemId === DEUTERIUM) route.inPort = false
+  for (const [i, { array, box, path }] of result.placed.entries()) {
+    const module = arrayModel(array)
+    const at = (u: number, v: number) => local(u + box.x + x, v + box.y + y)
+    for (const row of module.rows)
+      for (const g of row.groups) {
+        const p = at(g.centers[0], row.cy)
+        model.rows.push({
+          cy: p.y,
+          groups: [{ ...g, id: `array${i}-${g.id}`, letter: '氘', centers: [p.x] }],
+        })
+      }
+    model.stations.push(...module.stations.map((p) => at(p.x, p.y)))
+    model.devices.push(...module.devices.map((d) => ({ ...d, ...at(d.x, d.y) })))
+    model.routes.push(
+      ...module.routes.map((r) => ({
+        ...r,
+        cells: r.cells.map(([x, y, z]) => {
+          const p = at(x, y)
+          return [p.x, p.y, z]
+        }),
+      })),
+    )
+    if (path.length)
+      model.routes.push({
+        itemId: DEUTERIUM,
+        cells: path.map(([u, v, z]) => {
+          const p = local(u + x, v + y)
+          return [p.x, p.y, z]
+        }),
+      })
+    for (const [id, info] of Object.entries(module.items))
+      model.items[Number(id)] ??= { ...info, rate: 0 }
+    if (module.power) {
+      const power = (model.power ??= { ...module.power, nodes: [] })
+      if (power.name === module.power.name)
+        power.nodes.push(...module.power.nodes.map((p) => at(p.x, p.y)))
+    }
+  }
+  model.items[HYDROGEN].rate += result.rate
+  return model
+}
+
 /** 规划结果 → 页面要的结果：出蓝图、独立检查、各种数字和说明 */
 function describePlan(
   plan: PlanView,
@@ -976,11 +1091,12 @@ function describePlan(
   p: GeneratorParams,
   effort: Effort,
   threadCount: number,
+  fractionRate = 0,
 ) {
   const L = plan.layout
   const v = validate(plan.graph, L)
   const text = blueprintText(L, calc.label)
-  const { str, issues } = emitBlueprint(plan.graph, L, {
+  const { str: ordinary, issues } = emitBlueprint(plan.graph, L, {
     belt: Number(p.belt),
     sorter: Number(p.sorter),
     ...text,
@@ -988,7 +1104,61 @@ function describePlan(
     icons: calc.targets.map((t) => t.itemId),
     stationPrefs: p.stationPrefs,
   })
-  const check = checkBlueprint(str, { noTech: earlyGame(p) }) // 最低配置按没解锁超级磁场的存档查（原地竖直升降、太陡的坡都报错）
+  const check = checkBlueprint(ordinary, { noTech: earlyGame(p) })
+  const integrated =
+    fractionRate > 0
+      ? (() => {
+          if (!L.feasible || !v.ok || !check.ok || issues.length)
+            throw new Error(
+              `重氢分馏阵列需要可用的下游产线：${[...issues, ...v.errors, ...check.errors].slice(0, 3).join('；')}`,
+            )
+          const feeds = fractionFeeds(L)
+          if (Math.abs(feeds.reduce((n, f) => n + f.rate, 0) - fractionRate) > 1e-6)
+            throw new Error('产线的重氢入口运量与配方需求不一致')
+          return integrateFractionators(ordinary, feeds, Number(p.spray || 0), Number(p.belt), {
+            ...arrayLimits(p),
+            noLift: earlyGame(p),
+          })
+        })()
+      : null
+  const str = integrated ? withPrefs(integrated.blueprint, p.stationPrefs) : ordinary
+  const made = madeOf(calc)
+  const model = renderModel(plan.graph, L)
+  let energy = energyOf(calc, L, p)
+  if (integrated) {
+    made.parts.push({
+      id: DEUTERIUM,
+      rate: fractionRate,
+      factory: 2314,
+      count: integrated.count,
+      recipe: FRAC_RECIPE,
+      spray: Number(p.spray) > 0 ? 'speed' : null,
+      group: calc.units.length,
+    })
+    made.supplied = made.supplied.filter((s) => s.id !== DEUTERIUM)
+    const hydrogen = made.supplied.find((s) => s.id === HYDROGEN)
+    if (hydrogen) hydrogen.rate += fractionRate
+    else made.supplied.push({ id: HYDROGEN, rate: fractionRate })
+    fractionModel(model, integrated)
+    const extra = fracEnergy({ buildings: integrated.placed.flatMap((p) => p.array.buildings) })
+    const add = (k: keyof typeof extra & keyof typeof energy) => Number(extra[k]) + Number(energy[k])
+    energy = {
+      ...energyTexts({
+        total: add('total'),
+        factories: add('factories'),
+        sorters: energy.sorters,
+        addons: add('addons'),
+        stationIdle: add('stationIdle'),
+        stations: add('stations'),
+        stationCharge: add('stationCharge'),
+        byFactory: [...energy.byFactory, ...extra.byFactory],
+        idle: add('idle'),
+        work: add('work'),
+        sprayExtra: add('sprayExtra'),
+      }),
+      detail: `${energy.detail}；分馏塔 ${integrated.count} 台 ${fmtWatts(extra.factories)}`,
+    }
+  }
   const labels = groupLabels(plan.graph.groups) // 图例的字母和图上一样（熔炉用小写字母）
   const bs = beltStats(L) // 带子量，和重走守门同一个口径（src/plan/reroute.js）
   return {
@@ -1007,7 +1177,9 @@ function describePlan(
       stalled: !!plan.stalled,
     },
     metrics: {
-      ...blueprintSize(L), // 竖排时出出来的蓝图转了 90°，宽长对调
+      ...(integrated
+        ? { width: integrated.bp.dragBoxSize.x, height: integrated.bp.dragBoxSize.y }
+        : blueprintSize(L)),
       orient:
         plan.orientTried?.length > 1 || plan.orient === 'v'
           ? {
@@ -1022,11 +1194,17 @@ function describePlan(
                 : null,
             }
           : null,
-      area: L.area,
-      belts: L.belts,
+      area: integrated ? integrated.bp.dragBoxSize.x * integrated.bp.dragBoxSize.y : L.area,
+      belts: integrated
+        ? integrated.bp.buildings.filter((b) => b.itemId >= 2001 && b.itemId <= 2003).length
+        : L.belts,
       sorters: L.sorters,
-      factories: L.factories,
-      airBelts: L.airBelts,
+      factories: L.factories + (integrated?.count ?? 0),
+      airBelts: integrated
+        ? integrated.bp.buildings.filter(
+            (b) => b.itemId >= 2001 && b.itemId <= 2003 && b.localOffset[0].z > 0.25,
+          ).length
+        : L.airBelts,
       lifted: bs.lifts, // 原地竖直升降的节数（垂直传送带）
       steep: steepSteps(L), // 一格升一层的陡坡几步；这两样都要超级磁场
       noLift: !!L.noLift, // 按没解锁超级磁场出的图（earlyGame）：升降都是坡，页面不提垂直传送带
@@ -1061,13 +1239,18 @@ function describePlan(
           }
         : null,
     },
-    groups: plan.graph.groups.map((g) => ({
-      letter: labels.get(g.id) ?? g.letter,
-      item: g.item,
-      factory: g.factory,
-      count: g.count,
-      levels: g.levels ?? 1,
-    })),
+    groups: [
+      ...plan.graph.groups.map((g) => ({
+        letter: labels.get(g.id) ?? g.letter,
+        item: g.item,
+        factory: g.factory,
+        count: g.count,
+        levels: g.levels ?? 1,
+      })),
+      ...(integrated
+        ? [{ letter: '氘', item: '重氢', factory: '分馏塔', count: integrated.count, levels: 1 }]
+        : []),
+    ],
     // 化工厂、精炼厂按赤道的紧凑间距排的（左栏默认；页面检查栏写一句：只在赤道附近放得下）
     latitude: (() => {
       const gs = plan.graph.groups.filter((x) => hasHighLatitude(x.factoryId))
@@ -1083,10 +1266,13 @@ function describePlan(
       rate: b.rate,
       of: ITEMS.get(b.of)!.name,
     })),
-    made: madeOf(calc),
-    recipes: calc.units
-      .filter((u) => recipeChoices(u.itemId)[0]?.id !== u.recipeId)
-      .map((u) => ({ item: u.item, recipe: u.recipe })),
+    made,
+    recipes: [
+      ...calc.units
+        .filter((u) => recipeChoices(u.itemId)[0]?.id !== u.recipeId)
+        .map((u) => ({ item: u.item, recipe: u.recipe })),
+      ...(integrated ? [{ item: '重氢', recipe: FRAC_CHOICE.name }] : []),
+    ],
     addons: {
       spray: calc.spray
         ? {
@@ -1102,7 +1288,16 @@ function describePlan(
         : null,
       coaters: L.coaters?.length ?? 0,
       pilers: L.pilers?.length ?? 0,
-      notes: [...(L.addonNotes ?? []), ...(L.warperNotes ?? []), ...(L.storeNotes ?? [])],
+      notes: [
+        ...(L.addonNotes ?? []),
+        ...(L.warperNotes ?? []),
+        ...(L.storeNotes ?? []),
+        ...(integrated
+          ? [
+              `分馏阵列消耗外部供应的氢 ${+fractionRate.toFixed(2)}/分。${integrated.placed.some((p) => !p.path.length) ? '请给重氢站配本地运输机。' : '阵列由传送带向下游供应重氢。'}`,
+            ]
+          : []),
+      ],
       // 翘曲器整张一格（plan/stations.js 的 linkWarpers）：哪座站存、送到哪几座
       warper: (L.stations || []).some((st) => st.items.some((it) => String(it.role) === 'warper'))
         ? {
@@ -1121,22 +1316,58 @@ function describePlan(
             : `边缘第 ${pl.edge![1] + (L.origin?.y ?? 0)} ${L.rotated ? '列' : '行'}的入口`,
       ),
     },
-    model: renderModel(plan.graph, L),
-    ports: ports(plan.graph, L),
+    model,
+    ports: ports(plan.graph, L)
+      .filter((port) => !integrated || port.kind !== 'in' || port.item !== '重氢')
+      .map((port) =>
+        integrated
+          ? { ...port, y: port.y + (L.rotated ? integrated.shift.x : integrated.shift.y) }
+          : port,
+      ),
     stores: stores(L),
-    stations: (L.stations || []).map((st) => ({
-      ...toBlueprint(L, st.x + (L.origin?.x ?? 0), st.y + (L.origin?.y ?? 0)),
-      items: st.items.map((it) => ({
-        name:
-          ITEMS.get(it.itemId)?.name ?? plan.graph.items.get(it.itemId)?.name ?? String(it.itemId),
-        role: it.role,
-      })),
-      ports: st.ports.map((p) => ({
-        slot: p.slot,
-        dir: p.dir,
-        item: plan.graph.items.get(p.itemId)?.name ?? ITEMS.get(p.itemId)?.name ?? String(p.itemId),
-      })),
-    })),
+    stations: integrated
+      ? integrated.bp.buildings.filter(isStation).map((b) => ({
+          x: Math.round(b.localOffset[0].x),
+          y: Math.round(b.localOffset[0].y),
+          items: b.parameters.storage
+            .filter((s) => s.itemId)
+            .map((s) => ({
+              name: ITEMS.get(s.itemId)?.name ?? String(s.itemId),
+              role:
+                s.localRole === 1
+                  ? ('supply' as const)
+                  : s.localRole === 2
+                    ? ('demand' as const)
+                    : ('warper' as const),
+            })),
+          ports: b.parameters.slots.flatMap((s, slot) =>
+            s.dir
+              ? [
+                  {
+                    slot,
+                    dir: s.dir === 1 ? ('out' as const) : ('in' as const),
+                    item: ITEMS.get(b.parameters.storage[s.storageIdx - 1]?.itemId)?.name ?? '',
+                  },
+                ]
+              : [],
+          ),
+        }))
+      : (L.stations || []).map((st) => ({
+          ...toBlueprint(L, st.x + (L.origin?.x ?? 0), st.y + (L.origin?.y ?? 0)),
+          items: st.items.map((it) => ({
+            name:
+              ITEMS.get(it.itemId)?.name ??
+              plan.graph.items.get(it.itemId)?.name ??
+              String(it.itemId),
+            role: it.role,
+          })),
+          ports: st.ports.map((p) => ({
+            slot: p.slot,
+            dir: p.dir,
+            item:
+              plan.graph.items.get(p.itemId)?.name ?? ITEMS.get(p.itemId)?.name ?? String(p.itemId),
+          })),
+        })),
     penalties: L.penalties
       .filter((x) => x.kind !== 'fill' && x.kind !== 'long')
       .map((x) => ({ kind: x.kind, msg: x.msg }))
@@ -1154,7 +1385,7 @@ function describePlan(
       belt: ITEMS.get(BELT_IDS[Number(p.belt)] ?? 2003)?.name,
       sorter: ITEMS.get(Number(p.sorter))?.name,
     }, // 工厂小窗写传送带、分拣器是哪一级
-    energy: energyOf(calc, L, p),
+    energy,
   }
 }
 
@@ -1896,13 +2127,17 @@ export function installWorker(self: GeneratorWorkerScope) {
       )
     }
     const input = lineInput(p, targets, frac)
+    const calc = calculate(input)
+    const fractionRate = frac.on ? fractionDemand(calc) : 0
+    if (fractionRate > 0 && supplyOf(p))
+      return { error: '将分馏阵列接入产线时，请选择传送带或物流站供货。' }
     const pool = await poolReady()
     if (disposed || cancelled.has(id)) return { error: '已取消本轮生成。' } // 等帮手线程回话的工夫页面已经取消了：不开搜（不然白占着帮手线程，下一次生成要排在它后面）
     const effort = EFFORT[p.effort || 'normal']
     // 各轮退火分给各线程：轮数补成线程数的整数倍，墙上时间不变，搜得更广（4 线程时细档 6 轮补成 8 轮）
     const restarts = pool ? Math.ceil(effort.restarts / pool.size) * pool.size : effort.restarts
     // 网页不切块：大产线切块只在命令行和 tools/exam 里（src/plan/modules.js）
-    const est = estimateSeconds(calculate(input), effort, p, pool ? pool.size : 1)
+    const est = estimateSeconds(calc, effort, p, pool ? pool.size : 1)
     activeId = id
     const preview = previewer(
       id,
@@ -1927,7 +2162,7 @@ export function installWorker(self: GeneratorWorkerScope) {
         feasible: r.feasible,
         target: r.target,
       })
-    return planOne(calculate(input), p, helpers, effort, restarts, onRound, preview)
+    return planOne(calc, p, helpers, effort, restarts, onRound, preview, fractionRate)
   }
 
   /**
@@ -1964,10 +2199,13 @@ export function installWorker(self: GeneratorWorkerScope) {
           ...c.raw.map((r) => r.itemId),
         ]),
       ]
-      supplied =
-        frac.on && frac.isGoal
-          ? ['氢']
-          : calculate({ ...input, raw: frac.raw }).raw.map((r) => r.item)
+      if (frac.on && frac.isGoal) supplied = ['氢']
+      else {
+        const raw = calculate({ ...input, raw: frac.raw }).raw
+        supplied = raw.filter((r) => !frac.on || r.itemId !== DEUTERIUM).map((r) => r.item)
+        if (frac.on && raw.some((r) => r.itemId === DEUTERIUM) && !supplied.includes('氢'))
+          supplied.push('氢')
+      }
     } catch {
       chainItems = null
     }
@@ -2005,6 +2243,24 @@ export function installWorker(self: GeneratorWorkerScope) {
       for (const u of calc.units) by.set(u.factory, (by.get(u.factory) ?? 0) + (u.labs ?? u.count))
       const est = estimateSeconds(calc, EFFORT[p.effort || 'normal'], p, helperCount())
       const e = powerDemand(calc, { sorters: 0 }, { sorter: Number(p.sorter) })
+      const fractionRate = frac.on ? fractionDemand(calc) : 0
+      if (fractionRate > 0) {
+        if (supplyOf(p))
+          return {
+            error: '将分馏阵列接入产线时，请选择传送带或物流站供货。',
+            chainItems,
+            supplied,
+            ...rare,
+          }
+        const n = fractionTowerEstimate(
+          fractionRate,
+          Number(p.spray || 0),
+          p.station ? 1800 : (BELT_CAP[Number(p.belt)] ?? 1800),
+        )
+        by.set('分馏塔', n)
+        e.idle += n * IDLE_W[2314]
+        e.work += n * (ITEMS.get(2314)?.power ?? 0)
+      }
       return {
         machines: [...by.values()].reduce((n, x) => n + x, 0),
         byFactory: [...by]
@@ -2050,6 +2306,7 @@ export function installWorker(self: GeneratorWorkerScope) {
     restarts: number,
     onRound?: (r: RoundProgress) => void,
     preview: Preview | null = null,
+    fractionRate = 0,
   ) {
     const idForPlan = activeId
     let plan: PlanView
@@ -2136,7 +2393,7 @@ export function installWorker(self: GeneratorWorkerScope) {
         }
       }
     }
-    return describePlan(plan, calc, p, effort, helpers ? helpers.size : 1)
+    return describePlan(plan, calc, p, effort, helpers ? helpers.size : 1, fractionRate)
   }
 
   self.onmessage = async (ev) => {
@@ -2225,6 +2482,7 @@ export function installWorker(self: GeneratorWorkerScope) {
           )
           if (frac.on && frac.isGoal) throw new Error('重氢选了分馏塔阵列，无带蓝图排不了')
           const calc = calculate(lineInput({ ...p, supply: '' }, targets, frac))
+          if (frac.on && fractionDemand(calc) > 0) throw new Error('分馏阵列需要有带的下游产线。')
           const plan = dsqInput(calc, {
             belt: Number(p.belt ?? 3),
             sorter: Number(p.sorter ?? 2013),

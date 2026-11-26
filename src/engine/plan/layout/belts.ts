@@ -1,15 +1,6 @@
-import type {
-  RouteContext,
-  Position,
-  ItemFlow,
-  Leg,
-  Segment,
-  LabGap,
-  ChainPart,
-  IO,
-} from '../domain.js'
+import type { RouteContext, Position, ItemFlow, Leg, Segment, LabGap, ChainPart } from '../domain.js'
 
-type SideMaps = Record<'top' | 'bottom', Map<number, IO>>
+type SideMaps = Record<'top' | 'bottom', Set<number>>
 interface Consumer {
   p: Position
   d: number
@@ -53,6 +44,7 @@ interface ChainPlan {
   shortfall: number
   bad: number
   sprayShort: number
+  bootstrapMisses: number
   k: number
   geo: Geometry[]
   cols: Column[]
@@ -310,9 +302,9 @@ export function routeItems(c: RouteContext) {
   const offIn = gapOff !== null && gapOff.has('in')
   const offMid = gapOff !== null && gapOff.has('mid')
   // ---------- B. 每种物品的路线 ----------
-  const sides = new Map<string, SideMaps>() // 块 ID -> { bottom, top }，各是 itemId -> 'in' | 'out'
-  for (const bid of pos.keys()) sides.set(bid, { bottom: new Map(), top: new Map() })
-  const sideOf = (p: Position, ch: number) => (ch === p.row ? 'bottom' : 'top')
+  // 同一轨道在同一侧可以同时有进料和出料分拣器。
+  const sides = new Map<string, SideMaps>()
+  for (const bid of pos.keys()) sides.set(bid, { bottom: new Set(), top: new Set() })
   const segments: Segment[] = [] // 地面取放段
   const legs: Leg[] = [] // 高架段：in 原料入口→段，link 段→段，out 段→成品出口
   const chains: RouteContext['chains'] = [] // 每种物品按流向排列的 [{leg}|{seg}]
@@ -489,13 +481,17 @@ export function routeItems(c: RouteContext) {
             : beltCap,
           BELT_SPEED[opt.belt] * 60,
         )
+  const producerBlocks = (flow: ItemFlow) =>
+    flow.producerRates
+      ? [...flow.producerRates.keys()].flatMap((id) => blocksOf.get(id)!)
+      : blocksOf.get(flow.producer)!
   // 排物品的顺序：只能走某一个通道的先排，能二选一的后排（让它们去轨道少的那边）；原料入口随时可以多开，最后排
   const flex = (f: ItemFlow) => {
     if (f.producer === 'RAW') return 3
     // 生产者、消费者所在行的跨度：都在同一行时上下两个通道都行（both = 2），跨两行时只有中间那个（1），更远一个也没有（0）
     let lo = Infinity
     let hi = -Infinity
-    const ps = blocksOf.get(f.producer)!
+    const ps = producerBlocks(f)
     for (let i = 0; i < ps.length; i++) {
       lo = Math.min(lo, ps[i].row)
       hi = Math.max(hi, ps[i].row)
@@ -516,13 +512,13 @@ export function routeItems(c: RouteContext) {
    * 产物流量超过一条带的运力（pileCap；比如关掉集装机时 2070/分 的铁块）：按位置把生产者分成几组，每组一条带，
    * 消费者就近挂到还有余量的那一组；成品出口分到有富余的组。
    */
-  const splitFlow = (prods: Position[], cons: Consumer[], out: number, per: number) => {
-    const k = Math.ceil((prods.reduce((a, p) => a + p.n * per, 0) - TOL) / pileCap)
-    const total = prods.reduce((a, p) => a + p.n * per, 0)
+  const splitFlow = (prods: Position[], cons: Consumer[], out: number) => {
+    const total = prods.reduce((a, p) => a + p.n * productionAt(p), 0)
+    const k = Math.ceil((total - TOL) / pileCap)
     const bins: Bin[] = []
     let cur: Bin | null = null
     for (const p of prods.slice().sort((a, b) => a.row - b.row || a.x0 - b.x0)) {
-      const o = p.n * per
+      const o = p.n * productionAt(p)
       if (
         !cur ||
         (cur.P.length &&
@@ -548,7 +544,7 @@ export function routeItems(c: RouteContext) {
     // 精确分带（opt.exactSplit）：按块分带凑不齐（某条带消费比生产多）时，换生产者的切法、消费者的分法再找一遍
     if (opt.exactSplit && bins.some((b) => b.need > b.prod + TOL)) {
       const gap0 = bins.reduce((a, b) => a + Math.max(0, b.need - b.prod), 0)
-      const better = exactBins(prods, cons, per, k)
+      const better = exactBins(prods, cons, k)
       if (better && better.gap < gap0 - TOL) {
         bins.length = 0
         bins.push(...better)
@@ -567,9 +563,9 @@ export function routeItems(c: RouteContext) {
    * 放进「放得下里剩得最少」的带（放不下就放剩得最多的），再一步一步挪一个、换两个，压各条带的缺口合计。取缺口最小的切法
    * （一样时离得近的），比原来的缺口小才用。整台工厂取整，生产 60/分一台、消费 45/分一台时，等分常常凑不齐，换一种切法就正好
    */
-  const exactBins = (prods: Position[], cons: Consumer[], per: number, k: number) => {
+  const exactBins = (prods: Position[], cons: Consumer[], k: number) => {
     const P = prods.slice().sort((a, b) => a.row - b.row || a.x0 - b.x0)
-    const o = P.map((p) => p.n * per)
+    const o = P.map((p) => p.n * productionAt(p))
     const m = P.length
     if (m < k) return null
     const pre = [0]
@@ -739,12 +735,13 @@ export function routeItems(c: RouteContext) {
   // 当前这条带：物品 f、是不是原料、送到成品出口的量、带上的流量（产物）。
   // 下面 routeFlow、planChain、commitChain 读这几个量，各物品共用，不必每种物品重建一遍闭包
   let f: ItemFlow
+  const productionAt = (p: Position) => f.producerRates?.get(p.gid) ?? f.perFactory!
+  let recycleConsumers: Set<string> | null = null
   let isRaw = false
   // 原料带的入口只许在哪一边（−1 左、1 右、0 不限）：一种原料有几条带时都从同一边进（routeFlow 里定）
   let rawSide = 0
   let outRate = 0
   let rate = 0
-  let selfLoop = false // 这种物品的生产者自己也消耗它（同一个块又产又耗）
   /** 一个访问（挂在通道 ch 上的一组生产者 Ps、消费者 Cs）：取放事件按 Ps、Cs 的先后 */
   const makeVisit = (ch: number, Ps: Position[], Cs: Consumer[]) => {
     const e0 = nEv
@@ -753,7 +750,7 @@ export function routeItems(c: RouteContext) {
     for (let i = 0; i < Ps.length; i++) {
       const p = Ps[i]
       const tap = p.g.tap ?? 0 // 中间那列（见文件开头）
-      pushCenters(p, tap, f.perFactory!)
+      pushCenters(p, tap, productionAt(p))
       tmin = Math.min(tmin, p.tmin)
       tmax = Math.max(tmax, p.tmax)
     }
@@ -992,11 +989,11 @@ export function routeItems(c: RouteContext) {
         const p = EB[i]
         const prod = i < nP
         // 立刻记上，后面的块据此判断列是否够用（EF[i] 的 bottom、top 就是 sides 里这个块的两张表）
-        ;(ch === p.row ? EF[i].bottom : EF[i].top).set(f.itemId, prod ? 'out' : 'in')
+        ;(ch === p.row ? EF[i].bottom : EF[i].top).add(prod ? f.itemId : -f.itemId)
         const tap = p.g.tap ?? 0 // 中间那列（见文件开头）
         if (prod) {
           TP[np++] = p
-          pushCenters(p, tap, f.perFactory!)
+          pushCenters(p, tap, productionAt(p))
         } else {
           const cc = cons[i - nP]
           TC[nc++] = cc
@@ -1166,6 +1163,7 @@ export function routeItems(c: RouteContext) {
   let has = false
   let bCost = 0
   let bShortfall = 0
+  let bBootstrap = 0
   let bBad = 0
   let bSpray = 0
   // 第 0 段是劈开的那一段时（bAt[0] 为 −1）它的两端、劈开的位置、继续往下走的那一半、出口的方向和 x（consider 里算，最后建段时用）
@@ -1236,6 +1234,39 @@ export function routeItems(c: RouteContext) {
    * 顺序 ix 下枚举各段流向，逐个和最好的比；m 不是 null 时第 0 段从 m 劈开（和流向无关，mask 第 0 位恒为 0），cont 是继续往下走的那一半。
    * 劈开的那段只记几个数（sA … sExitX），成了最好的方案才抄进 bS*，最后建段时才建对象
    */
+  function bootstrapMisses(order: number[], k: number): number {
+    if (!recycleConsumers) return 0
+    let supplied = false
+    let misses = 0
+    let lastReturn = -1
+    for (let i = 0; i < k; i++)
+      if (vis[order[i]].C.some(({ p }) => recycleConsumers!.has(p.gid))) lastReturn = i
+    for (let i = 0; i <= lastReturn; i++) {
+      const visit = vis[order[i]]
+      const d = mD[i]
+      let firstSource = Infinity
+      if (!supplied) {
+        for (const p of visit.P) {
+          if (recycleConsumers.has(p.gid)) continue
+          const first = d > 0 ? p.centers[0] : p.centers[p.centers.length - 1]
+          firstSource = Math.min(firstSource, d * first)
+        }
+      }
+      let lastIntake = -Infinity
+      for (const { p } of visit.C) {
+        if (!recycleConsumers.has(p.gid)) continue
+        for (const cx of p.centers) if (!supplied && d * cx < firstSource) misses++
+        const last = d > 0 ? p.centers[p.centers.length - 1] : p.centers[0]
+        lastIntake = Math.max(lastIntake, d * last)
+      }
+      for (const { p } of visit.C) {
+        if (recycleConsumers.has(p.gid)) continue
+        for (const cx of p.centers) if (i < lastReturn || d * cx < lastIntake) misses++
+      }
+      supplied ||= firstSource < Infinity
+    }
+    return misses
+  }
   const consider = (ix: number[], m: number | null, cont: Cont) => {
     const k = vk
     const visits = vis
@@ -1433,6 +1464,7 @@ export function routeItems(c: RouteContext) {
             (GB[ac] - GA[ac] + 1)
         }
       }
+      const bootstrap = bootstrapMisses(ix, k)
       // 还没接的各截高架至少多长（rest[i]：第 i 截起）：已经找过竖直列的按实际的算，没找过的
       // 两头各隔至少 1 格，横向不少于 2 格、不少于两头的距离，再加竖直跨过的通道；找不到列时按走不通（bad，5000）算，所以每截至多计 5000
       // （每截那一项就是 RT 里记的，见上面和下面 column 处；rest 只在剪枝时读，不剪枝时不算）
@@ -1457,6 +1489,7 @@ export function routeItems(c: RouteContext) {
             shortfall * 1000 +
               (bad + outBad) * 5000 +
               sprayShort * 5000 +
+              bootstrap * 5000 +
               len +
               (outLen >= 0 ? outLen : 0) +
               rest[i] <
@@ -1495,10 +1528,11 @@ export function routeItems(c: RouteContext) {
       if (cut) continue
       if (outLen >= 0) len += outLen
       bad += outBad
-      const cost = shortfall * 1000 + bad * 5000 + sprayShort * 5000 + len
+      const cost = shortfall * 1000 + bad * 5000 + sprayShort * 5000 + bootstrap * 5000 + len
       if (!has || cost < bCost - TOL) {
         has = true
         bCost = cost
+        bBootstrap = bootstrap
         bShortfall = shortfall
         bBad = bad
         bSpray = sprayShort
@@ -1777,10 +1811,12 @@ export function routeItems(c: RouteContext) {
     }
     if (outLen >= 0) len += outLen
     bad += outBad
-    const cost = shortfall * 1000 + bad * 5000 + sprayShort * 5000 + len
+    const bootstrap = bootstrapMisses(ix, k)
+    const cost = shortfall * 1000 + bad * 5000 + sprayShort * 5000 + bootstrap * 5000 + len
     if (!has || cost < bCost - TOL) {
       has = true
       bCost = cost
+      bBootstrap = bootstrap
       bShortfall = shortfall
       bBad = bad
       bSpray = sprayShort
@@ -1914,7 +1950,7 @@ export function routeItems(c: RouteContext) {
       consider(ix, null, null)
     }
     // 喷增产剂时不劈段：先 P 后 C 的顺序下供给缺口恒为 0，用不上；劈开的死胡同那一半也没法喷
-    if (!sprayHere && !isRaw && has && bShortfall > TOL) {
+    if (!sprayHere && !isRaw && !recycleConsumers && has && bShortfall > TOL) {
       // 两个方向都不够时，试试把第一段从生产者中间劈开、两半背向而流
       for (let o = 0; o < orders.length; o++) {
         const ix = orders[o]
@@ -1934,6 +1970,7 @@ export function routeItems(c: RouteContext) {
       shortfall: 0,
       bad: 0,
       sprayShort: 0,
+      bootstrapMisses: 0,
       k: 0,
       geo: [],
       cols: [],
@@ -1943,6 +1980,7 @@ export function routeItems(c: RouteContext) {
     res.shortfall = bShortfall
     res.bad = bBad
     res.sprayShort = bSpray
+    res.bootstrapMisses = bBootstrap
     res.k = k
     res.flow = flow
     // 各段：劈开的那段照 consider 记下的 bS* 建，其余照 segOf 的结果建出来（每个字段都重写）
@@ -2018,6 +2056,13 @@ export function routeItems(c: RouteContext) {
       )
     if (best.bad)
       addPenalty('route', P.route * best.bad, `${f.name} 找不到能竖直穿过的空列`, itemBids(f.itemId))
+    if (best.bootstrapMisses)
+      addPenalty(
+        'shortfall',
+        P.shortfall * best.bootstrapMisses,
+        `${f.name} 的上游供料和回流取料需要排在下游之前`,
+        itemBids(f.itemId),
+      )
     if (best.sprayShort)
       addPenalty(
         'spray',
@@ -2054,7 +2099,7 @@ export function routeItems(c: RouteContext) {
       const g2 = g.gap === 'mid' || g.gap === 'join' ? geo[i + 1] : null // 'join'：实验开关 offMid 下接成一条但不留空当
       let nt = 0
       for (let j = 0; j < v.P.length; j++)
-        TT[nt++] = { bid: v.P[j].bid, io: 'out', rate: f.perFactory! }
+        TT[nt++] = { bid: v.P[j].bid, io: 'out', rate: productionAt(v.P[j]) }
       for (let j = 0; j < v.C.length; j++) TT[nt++] = { bid: v.C[j].p.bid, io: 'in', rate: v.C[j].d }
       if (g2)
         for (let j = 0; j < g2.v.C.length; j++)
@@ -2095,16 +2140,6 @@ export function routeItems(c: RouteContext) {
       const ns = 2 * chSegN[v.key]++
       cs[ns] = a
       cs[ns + 1] = b
-      // 挂通道时已经按同一侧记过；只有同一个块又产又耗这种物品时（selfLoop）两次记的值可能不同，要按这里的先后再记一遍
-      if (selfLoop) {
-        for (let j = 0; j < v.P.length; j++)
-          sides.get(v.P[j].bid)![sideOf(v.P[j], v.ch)].set(f.itemId, 'out')
-        for (let j = 0; j < v.C.length; j++)
-          sides.get(v.C[j].p.bid)![sideOf(v.C[j].p, v.ch)].set(f.itemId, 'in')
-        if (g2)
-          for (let j = 0; j < g2.v.C.length; j++)
-            sides.get(g2.v.C[j].p.bid)![sideOf(g2.v.C[j].p, v.ch)].set(f.itemId, 'in')
-      }
       if (pending) {
         pending.to = seg.id // 高架段的 to 先占好位置（-1），这里填上
         if (pending.kind === 'in' && seg.sprayGap === 'legIn')
@@ -2228,10 +2263,10 @@ export function routeItems(c: RouteContext) {
       if (flexOf[t] !== k) continue
       f = items[t]
       isRaw = f.producer === 'RAW'
-      selfLoop = false
       const fcons = f.consumers
-      for (let j = 0; j < fcons.length; j++) if (fcons[j].to === f.producer) selfLoop = true
-      const prodAll = isRaw ? NO_BLOCKS : blocksOf.get(f.producer)!
+      const returning = f.producerRates ? fcons.filter(({ to }) => f.producerRates!.has(to)) : []
+      recycleConsumers = returning.length ? new Set(returning.map(({ to }) => to)) : null
+      const prodAll = isRaw ? NO_BLOCKS : producerBlocks(f)
       // 消费者的块先放在 CA 里：CA 和里面的 {p, d} 各物品共用、逐项重写（访问、方案只在这一种物品里用它，段里抄的是它的字段值）
       let nCons = 0
       let outAll = 0
@@ -2249,11 +2284,11 @@ export function routeItems(c: RouteContext) {
           cc.d = c.rate / g.count
         }
       }
-      if (!isRaw && graph.byId.get(f.producer)!.sideItem === f.itemId)
+      if (!isRaw && !f.producerRates && graph.byId.get(f.producer)!.sideItem === f.itemId)
         routeGaps(prodAll, outAll, graph.byId.get(f.producer)!.count)
       else if (isRaw || f.rate <= pileCap + TOL) routeFlow(prodAll, CA, nCons, outAll, f.rate)
       else
-        for (const part of splitFlow(prodAll, CA.slice(0, nCons), outAll, f.perFactory!))
+        for (const part of splitFlow(prodAll, CA.slice(0, nCons), outAll))
           routeFlow(part.P, part.C, part.C.length, part.out, part.rate)
     }
   }

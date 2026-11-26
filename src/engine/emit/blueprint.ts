@@ -293,7 +293,8 @@ export function emitBlueprint(graph: EmitGraph, layout: EmitLayout, opt: EmitOpt
         }
         const f = fresh(p.g.factoryId)
         f.localOffset = at(cx, cy)
-        f.yaw = [0, 0]
+        const yaw = p.g.yaw ?? 0
+        f.yaw = [yaw, yaw]
         f.recipeId = p.g.recipeId
         f.parameters =
           p.g.kind === 'lab' ? { researchMode: 1, acceleratorMode: 0 } : { acceleratorMode: 0 }
