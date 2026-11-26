@@ -3,9 +3,9 @@
   "ignorePatterns": [
     "dist/**",
     ".agent-temp/**",
-    "web/calc/dsq-data.js",
-    "web/calc/calc-icons.js",
-    "src/beltless/dsq.js"
+    "public/vendor/dsq/dsq-data.js",
+    "public/generated/calc/calc-icons.js",
+    "src/engine/beltless/vendor/dsq/dsq.js"
   ],
   "plugins": ["react", "typescript", "oxc", "jsx-a11y"],
   "categories": {

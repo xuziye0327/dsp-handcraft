@@ -4,10 +4,10 @@
     "dist/**",
     ".agent-temp/**",
     "data/**",
-    "web/**/*.html",
-    "web/calc/dsq-data.js",
-    "web/calc/calc-icons.js",
-    "src/beltless/dsq.js"
+    "src/web/**/*.html",
+    "public/vendor/dsq/dsq-data.js",
+    "public/generated/calc/calc-icons.js",
+    "src/engine/beltless/vendor/dsq/dsq.js"
   ],
   "printWidth": 101,
   "tabWidth": 2,

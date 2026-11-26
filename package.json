@@ -3,16 +3,16 @@
   "private": true,
   "license": "GPL-3.0-only",
   "type": "module",
-  "module": "src/index.ts",
+  "module": "src/engine/index.ts",
   "scripts": {
     "fmt": "oxfmt",
     "fmt:check": "oxfmt --check",
     "check": "oxlint --type-aware --type-check",
     "check:fix": "oxlint --type-aware --type-check --fix",
     "prepare": "husky",
-    "typecheck": "tsc --noEmit",
-    "build": "bun web/build.ts",
-    "dev": "bun web/dev.ts"
+    "build": "bun --bun vite build",
+    "dev": "bun --bun vite",
+    "preview": "bun --bun vite preview"
   },
   "dependencies": {
     "pako": "3.0.3",
@@ -23,12 +23,12 @@
     "@types/bun": "latest",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
-    "esbuild": "^0.28.2",
     "husky": "^9.1.7",
     "lint-staged": "^17.6.0",
     "oxfmt": "^0.78.0",
     "oxlint": "^1.93.0",
-    "oxlint-tsgolint": "^7.0.2006"
+    "oxlint-tsgolint": "^7.0.2006",
+    "vite": "^8.3.8"
   },
   "peerDependencies": {
     "typescript": "^7"
