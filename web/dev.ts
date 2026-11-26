@@ -26,7 +26,7 @@ function changed() {
       })
   }, 100)
 }
-for (const dir of ['web', 'src', 'data', 'icons', 'img'])
+for (const dir of ['web', 'src', 'data', 'icons'])
   watch(join(root, dir), { recursive: true }, changed)
 const server = Bun.serve({
   hostname: '127.0.0.1',

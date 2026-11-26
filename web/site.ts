@@ -17,8 +17,6 @@ interface Metadata {
   name: string
   title: string
   description: string
-  image: string
-  imageAlt: string
 }
 type Pages = Record<Language, Metadata>
 const GEN: Pages = {
@@ -28,8 +26,6 @@ const GEN: Pages = {
     title: '戴森球计划蓝图生成器 · 产线自动排布',
     description:
       '戴森球计划产线蓝图生成器：选好目标产物和每分钟产量，自动排出手搓风格的产线蓝图（每种物品走自己的带，工厂分行、行间夹传送带通道），复制后贴进游戏。在浏览器里运行，不用安装。',
-    image: 'img/screenshot-zh.webp',
-    imageAlt: '蓝图生成器：引力矩阵 60/分',
   },
   en: {
     path: 'en/',
@@ -37,8 +33,6 @@ const GEN: Pages = {
     title: 'DSP Blueprint Generator · Dyson Sphere Program',
     description:
       'Pick a product and a rate per minute and get a Dyson Sphere Program production-line blueprint, laid out the way players build by hand. Free, in your browser.',
-    image: 'img/screenshot-en.webp',
-    imageAlt: 'The generator with a Gravity Matrix 60/min line',
   },
 }
 const CALC: Pages = {
@@ -48,8 +42,6 @@ const CALC: Pages = {
     title: '戴森球计划量产计算器 · 产线配比',
     description:
       '戴森球计划量产计算器：选目标物品和每分钟产量，算出每种设备要几台、要多少原料；点「生成蓝图」接着排成手搓风格的产线蓝图，也能出无带流蓝图，复制后贴进游戏。在浏览器里运行，不用安装。',
-    image: 'img/calc-zh.webp',
-    imageAlt: '量产计算器：绿矩阵（引力矩阵）60/分的生产清单',
   },
   en: {
     path: 'en/calc/',
@@ -57,8 +49,6 @@ const CALC: Pages = {
     title: 'DSP Production Calculator · Dyson Sphere Program',
     description:
       'Pick target items and a rate per minute, calculate buildings and raw materials, then turn the line into a blueprint you can paste into the game. Free, in your browser.',
-    image: 'img/calc-en.webp',
-    imageAlt: 'The calculator with a Gravity Matrix 60/min production list',
   },
 }
 const tipsMeta = (lang: Language) => ({
@@ -90,11 +80,6 @@ function headTags(pages: Pages, lang: Language) {
     title: p.title,
     description: p.description,
     url: url(pages, lang),
-    image: SITE + p.image,
-    'image:type': 'image/webp',
-    'image:width': '2880',
-    'image:height': '1800',
-    'image:alt': p.imageAlt,
     locale: locale(lang),
     'locale:alternate': locale(other(lang)),
   }
@@ -105,7 +90,7 @@ function headTags(pages: Pages, lang: Language) {
     ...Object.entries(og).map(
       ([key, value]) => `<meta property="og:${key}" content="${esc(value)}">`,
     ),
-    '<meta name="twitter:card" content="summary_large_image">',
+    '<meta name="twitter:card" content="summary">',
   ].join('\n')
 }
 function faqSchema(items: { q: string; a: string[] }[], lang: Language) {

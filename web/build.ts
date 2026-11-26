@@ -80,16 +80,9 @@ export async function buildSite(embed?: string) {
   }
   await Promise.all([
     ...Object.entries(files).map(([path, content]) => emit(join(output, path), content)),
-    ...[
-      'icons',
-      'img',
-      'favicon.ico',
-      'LICENSE',
-      'CNAME',
-      '.nojekyll',
-      'data/THIRD_PARTY.md',
-      'data/LICENSE-dsp-calc-MulanPSL2.txt',
-    ].map((path) => cp(join(root, path), join(output, path), { recursive: true })),
+    ...['icons', 'favicon.ico'].map((path) =>
+      cp(join(root, path), join(output, path), { recursive: true }),
+    ),
     ...['react', 'react-dom', 'scheduler', 'pako'].map((pkg) =>
       cp(join(root, 'node_modules', pkg, 'LICENSE'), join(output, 'licenses', `${pkg}.txt`)),
     ),
