@@ -25,6 +25,7 @@ export function translateLayout<L extends Layout>(L: L, dx: number, dy: number):
     points(l.cells)
     points(l.stub)
     points(l.pre)
+    points(l.extension)
   }
   for (const p of L.ports) {
     p.x += dx

@@ -122,6 +122,7 @@ export function chainTiles(layout: ChainLayout, chain: Chain) {
       const l = layout.legs[part.leg]
       if (l.kind === 'in') {
         inPort = true
+        if (l.extension) main.push(...l.extension)
         // 物流站：先是站口那两节短带（从站往外），再到走廊里的出入口格
         if (l.stub) {
           main.push(...l.stub)
@@ -138,6 +139,7 @@ export function chainTiles(layout: ChainLayout, chain: Chain) {
           main.push(...l.stub.slice().reverse())
           outStation = l.station
         }
+        if (l.extension) main.push(...l.extension.slice().reverse())
       } else {
         main.push(...l.cells)
       }

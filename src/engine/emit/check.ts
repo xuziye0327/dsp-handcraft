@@ -248,7 +248,7 @@ function unreachablePorts(B: Building[], P: Locate) {
   ]
   const out: BlockedPort[] = []
   const rays: PortRay[] = []
-  const entries = new Map<number, (Point2 & { left: boolean })[]>() // 原料 → 它的各个入口 { x, y, left 在左半边 }
+  const entries = new Map<number, { edge: number; offset: number }[]>()
   for (const b of belts) {
     if (!b.parameters?.iconId || !onGround(b)) continue
     const isIn =
@@ -276,12 +276,19 @@ function unreachablePorts(B: Building[], P: Locate) {
     if (!free.length)
       out.push({ index: b.index, itemId: b.parameters.iconId, kind: isIn ? 'in' : 'out' })
     rays.push({ x: P(b).x, y: P(b).y, free }) // 每个口能走出去的方向（拼接时别让别的块挡住，见 portRays）
-    if (isIn)
+    if (isIn && free.length) {
+      const { x, y } = P(b)
+      const distance = (dx: number, dy: number) =>
+        dx > 0 ? x1 - x : dx < 0 ? x - x0 : dy > 0 ? y1 - y : y - y0
+      const straight = ([dx, dy]: XY) => Number(dx === -ox && dy === -oy)
+      const [dx, dy] = free
+        .slice()
+        .sort((a, b) => distance(...a) - distance(...b) || straight(b) - straight(a))[0]
       listAt(entries, b.parameters.iconId).push({
-        x: P(b).x,
-        y: P(b).y,
-        left: P(b).x - x0 <= x1 - P(b).x,
+        edge: DIRS.findIndex(([a, b]) => a === dx && b === dy),
+        offset: dx ? y : x,
       })
+    }
   }
   return { blocked: out, entries, rays }
 }
@@ -811,15 +818,16 @@ export function checkBlueprint(str: string, opt: { noTech?: boolean; maxErrors?:
     err(
       `${q.kind === 'in' ? '入口' : '出口'}传送带 ${q.index}（${name(q.itemId)}）往外接不出去：四个方向沿地面走出图外都被挡住`,
     )
-  // 3e. 同一种原料的几个入口在一处（同一边，相邻两个口中间空不超过 3 行），不在一处的记提醒
+  // 3e. 同一种原料的入口应在同一边，相邻口中间相隔不超过 3 格。
   for (const [item, es] of ports.entries) {
     if (es.length < 2) continue
-    const ys = es.map((e) => e.y).sort((a, b) => a - b)
-    const gap = Math.max(...ys.slice(1).map((y, i) => y - ys[i] - 1))
-    if (es.some((e) => e.left) && es.some((e) => !e.left))
-      warnings.push(`原料「${name(item)}」的入口分在左右两边`)
-    else if (gap > 3)
-      warnings.push(`原料「${name(item)}」的入口没挨在一起：相邻两个口中间空了 ${gap} 行`)
+    if (es.some((e) => e.edge !== es[0].edge)) {
+      warnings.push(`原料「${name(item)}」的入口分在不同边`)
+      continue
+    }
+    const offsets = es.map((e) => e.offset).sort((a, b) => a - b)
+    const gap = Math.max(...offsets.slice(1).map((v, i) => v - offsets[i] - 1))
+    if (gap > 3) warnings.push(`原料「${name(item)}」的入口没挨在一起：相邻两个口中间空了 ${gap} 格`)
   }
 
   // 4. 分拣器几何：直线、长度 1~3、端点落在所连对象上、槽位与位置一致、不太斜

@@ -1,6 +1,7 @@
 import type { ProductionUnit } from '../calc/calculator.js'
 import type { Factory, Side } from '../gamedata.js'
 import type { groundOptions } from './ground.js'
+import type { PortPositions, PortSide } from './port-position.js'
 import type { REROUTE, rerouteOptions } from './reroute.js'
 import type { DEFAULTS } from './route.js'
 
@@ -180,6 +181,7 @@ export interface Leg {
   direct?: boolean
   pre?: Tile[]
   stub?: Tile[]
+  extension?: Tile[]
   spray?: { seg: number; side: IO }
   level?: number
   broken?: boolean
@@ -197,6 +199,7 @@ export interface Chain {
 }
 export interface Port extends Point {
   kind: IO
+  side?: PortSide
   itemId: number
   rate: number
   leg?: number
@@ -422,6 +425,8 @@ export interface StationSetting {
   slots?: StationSlots | null
 }
 export interface FinishContext {
+  portPositions?: PortPositions
+  outputItems?: Set<number>
   station?: (StationOption & { place: 'edge' | 'side' }) | null
   power?: PowerType | null
   powerOptions?: PowerOptions
@@ -535,6 +540,7 @@ export interface RoundProgress {
   target: number
 }
 export interface PlanOptions {
+  portPositions?: PortPositions
   routeOptions?: RouteOptions
   iterations?: number
   restarts?: number

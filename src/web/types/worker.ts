@@ -30,6 +30,7 @@ export interface GeneratorParams {
   maxwidth?: Field
   maxheight?: Field
   orient?: PlanOptions['orient']
+  portPositions?: PlanOptions['portPositions']
   power?: '' | 'tesla' | 'substation'
   station?: string
   supply?: string

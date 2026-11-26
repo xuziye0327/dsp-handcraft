@@ -30,10 +30,12 @@ import type {
 // 没有时间上限时，两种驱动的结果完全一致。
 import { buildGraph } from './graph.js'
 import { groundRoutes, groundOptions } from './ground.js'
+import { placeEdgePorts } from './place-edge-ports.js'
 import { optimize, mergeRounds, precompute, cachedRank, rankCands, adoptCands } from './place.js'
+import { unrotatePorts } from './port-position.js'
 import { addPower, placePower, fitPlacement } from './power.js'
 import { rerouteBelts, rerouteOptions, beltStats, rerouteWorse } from './reroute.js'
-import { stackCapOf, sorterStackOf } from './route.js'
+import { DEFAULTS, stackCapOf, sorterStackOf } from './route.js'
 import { attachStations, linkWarpers, cropToContent } from './stations.js'
 import { addStores, addProStores, isColumnSupply } from './storage.js'
 import type { WorkerPool } from './tasks.js'
@@ -342,6 +344,24 @@ export function finishTail(L: Layout, ctx: FinishContext, other: number): Finish
       ]
     }
   }
+  if (
+    L.feasible &&
+    !station &&
+    !ctx.supply &&
+    ctx.portPositions &&
+    ctx.outputItems &&
+    !placeEdgePorts(L, ctx.portPositions, ctx.outputItems, { maxWidth, maxHeight })
+  ) {
+    L.feasible = false
+    L.penalties = [
+      ...L.penalties,
+      {
+        kind: 'port-position',
+        amount: DEFAULTS.penalty.route,
+        msg: '无法将传送带接到指定的出入口方位。试试其他方位、自动排布或放宽尺寸上限。',
+      },
+    ]
+  }
   // 不用原地升降（route.js 的 noLift）：高架走坡，接物流站、仓组、翘曲器的线只走地面；还剩原地竖直升降的（增产剂带之类还不会走坡）
   // 按不可行处理，免得出一张没解锁超级磁场贴不上的图
   if (L.noLift) {
@@ -394,6 +414,7 @@ export function* planSteps(calc: Calculation, options: PlanOptions = {}): Steps<
   const ro = options.routeOptions || {}
   const swapped = () => ({
     ...options,
+    portPositions: unrotatePorts(options.portPositions),
     routeOptions: { ...ro, maxWidth: ro.maxHeight ?? null, maxHeight: ro.maxWidth ?? null },
   })
   const orient = options.orient ?? 'h'
@@ -587,7 +608,10 @@ function* planFrame(
     // 帮手线程按 snapshotMs 开关自己装钩子（src/web/worker.ts 的 task 分支）
     return o
   }
+  const outputItems = options.portPositions && new Set(calc.targets.map((t) => t.itemId))
   const ctx = (aw = routeOptions.areaWeight ?? 1): FinishContext => ({
+    portPositions: options.portPositions,
+    outputItems,
     station: station && { ...station },
     power,
     powerOptions: options.powerOptions,
@@ -925,6 +949,8 @@ export function finishContext(calc: Calculation, options: PlanOptions): FinishCo
       ? { place: 'edge', stack: ro.externalStack, slots: ro.stationSlots }
       : null
   return {
+    portPositions: options.portPositions,
+    outputItems: options.portPositions && new Set(calc.targets.map((t) => t.itemId)),
     station,
     power: ro.power ?? null,
     powerOptions: ro.powerOptions,

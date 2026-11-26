@@ -1,3 +1,4 @@
+import { PORT_POSITIONS, type PortPosition } from '../../engine/plan/port-position.js'
 import { readDefs, type HandoffPlan } from '../handoff.js'
 import type { GeneratorParams } from '../types/worker'
 import { groups, type OptionName } from './options'
@@ -26,6 +27,8 @@ export const defaults: Record<SavedOption, string> = {
   supply: '',
   dist: '0',
   fracengine: 'template',
+  inlet: '',
+  outlet: '',
 }
 export type RolePrefs = { localRole: number; remoteRole: number; max: number }
 export interface StationPreferences {
@@ -169,16 +172,24 @@ export function chooseOption(s: Settings, k: OptionName, v: string) {
   }
   if ((k === 'maxwidth' || k === 'maxheight') && s[k]) s.aspect = ''
 }
+export const canPlacePorts = (s: Settings) => !s.station && !s.supply && s.recipes[1121] !== 115
+const portPosition = (v: string) =>
+  Object.hasOwn(PORT_POSITIONS, v) ? (v as PortPosition) : undefined
+
 export function buildParams(s: Settings, h: Handoff | null) {
   const options = { ...defaults }
   for (const k of savedOptions) options[k] = s[k]
+  const { inlet, outlet, ...equipment } = options
   return {
     targets: s.targets.map((t) => ({ target: t.id, rate: t.rate })),
     raw: [...s.ext],
     recipes: { ...s.recipes },
     rare: s.rare && !h,
     rareOff: [...s.rareOff],
-    ...options,
+    ...equipment,
+    ...(canPlacePorts(s) && (inlet || outlet)
+      ? { portPositions: { in: portPosition(inlet), out: portPosition(outlet) } }
+      : {}),
     power: s.power === 'substation' || s.power === 'tesla' ? s.power : '',
     effort: s.effort === 'fine' ? 'fine' : 'normal',
     stationPrefs: s.stationPrefs,

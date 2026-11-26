@@ -1,3 +1,10 @@
+import { PORT_POSITIONS } from '../../engine/plan/port-position.js'
+
+const portChoices = [
+  { value: '', text: '自动' },
+  ...Object.entries(PORT_POSITIONS).map(([value, { text }]) => ({ value, text })),
+]
+
 export interface Choice {
   value: string
   text: string
@@ -24,6 +31,8 @@ export const options = {
       },
     ],
   },
+  inlet: { title: '材料入口方位', choices: portChoices },
+  outlet: { title: '最终产物出口方位', choices: portChoices },
   supply: {
     title: '箱子',
     choices: [

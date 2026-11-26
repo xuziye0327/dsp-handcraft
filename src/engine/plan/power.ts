@@ -199,6 +199,7 @@ function mark(L: PowerGeometry, rowGaps: boolean, power: number | null, occ: Occ
         const l = L.legs[part.leg]
         if (l.kind === 'in' || l.kind === 'out') {
           if (l.stub) cells(l.stub)
+          if (l.extension) cells(l.extension)
           if (l.kind === 'in' && l.pre) cells(l.pre)
           if (!l.direct) add(l.edge!, l.py!)
         }

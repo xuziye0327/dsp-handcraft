@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from 'react'
 
 import { groups, type OptionName } from './options'
-import { labStack, limitValue, valueOf, type Settings } from './settings'
+import { canPlacePorts, labStack, limitValue, valueOf, type Settings } from './settings'
 export interface OptionProps {
   state: Settings
   choose: (k: OptionName, v: string) => void
@@ -105,6 +105,30 @@ function Field({ name, hidden, ...p }: OptionProps & { name: OptionName; hidden?
     </fieldset>
   )
 }
+function PortPosition({
+  name,
+  state,
+  choose,
+  disabled,
+}: OptionProps & { name: 'inlet' | 'outlet'; disabled: boolean }) {
+  const { title, choices } = groups[name]
+  return (
+    <label className="field port-position">
+      <span>{title}</span>
+      <select
+        disabled={disabled}
+        value={state[name]}
+        onChange={(e) => choose(name, e.currentTarget.value)}
+      >
+        {choices.map(({ value, text }) => (
+          <option key={value} value={value}>
+            {text}
+          </option>
+        ))}
+      </select>
+    </label>
+  )
+}
 function LabHeight({ state, onHeight }: { state: Settings; onHeight: (n: number) => void }) {
   const [height, setHeight] = useState(String(state.labstack))
   return (
@@ -148,6 +172,7 @@ export function SettingsForm({
 }) {
   const connected = !!state.station,
     boxed = !connected && !!state.supply
+  const portPositionsAvailable = canPlacePorts(state)
   const field = (name: OptionName, hidden = false) => (
     <Field key={name} state={state} choose={choose} name={name} hidden={hidden} />
   )
@@ -164,6 +189,25 @@ export function SettingsForm({
     >
       {goals}
       {field('effort', beltless)}
+      {!beltless && (
+        <>
+          <PortPosition
+            name="inlet"
+            state={state}
+            choose={choose}
+            disabled={!portPositionsAvailable}
+          />
+          <PortPosition
+            name="outlet"
+            state={state}
+            choose={choose}
+            disabled={!portPositionsAvailable}
+          />
+          {!portPositionsAvailable && (
+            <p className="hint">普通产线选择「传送带」供货时可设置方位。</p>
+          )}
+        </>
+      )}
       {actions}
       {field('supply', !boxed)}
       {field('dist', !boxed)}

@@ -92,6 +92,7 @@ import { blueprintText, blueprintSize, spaceStats } from '../engine/metrics/spac
 import { buildGraph } from '../engine/plan/graph.ts'
 import { planLine, planLineAsync, planSteps } from '../engine/plan/index.ts'
 import { pileCapOf } from '../engine/plan/piling.ts'
+import { clockwiseSide } from '../engine/plan/port-position.ts'
 import { beltStats } from '../engine/plan/reroute.ts'
 import { DEFAULTS as ROUTE_DEFAULTS } from '../engine/plan/route.ts'
 import { SORTER_SPEED } from '../engine/plan/sorters.ts'
@@ -682,20 +683,21 @@ function stores(L: Layout) {
   )
 }
 
-/** 原料入口与成品出口，告诉玩家从哪接 */
+const SIDE_TEXT = { left: '左', right: '右', top: '上', bottom: '下' }
 function ports(graph: Graph, L: Layout) {
   return L.ports.map((p) => {
-    const left = p.x < L.width / 2
-    const at = p.y + (L.origin?.y ?? 0) // 「第几行」按蓝图里的坐标说，外沿加地后要平移
+    const side = p.side ?? (p.x < L.width / 2 ? 'left' : 'right')
+    const edge = L.rotated ? clockwiseSide[side] : side
+    const column = edge === 'top' || edge === 'bottom'
+    const { x, y } = toBlueprint(L, p.x + (L.origin?.x ?? 0), p.y + (L.origin?.y ?? 0))
     return {
       kind: p.kind,
       item: graph.items.get(p.itemId)?.name ?? ITEMS.get(p.itemId)?.name ?? String(p.itemId),
       rate: p.rate,
-      // 竖排的蓝图整张顺时针转了 90°：原来的左边成了上边、右边成了下边，第几行成了第几列
-      side: L.rotated ? (left ? '上' : '下') : left ? '左' : '右',
-      unit: L.rotated ? '列' : '行',
-      x: p.x,
-      y: at,
+      side: SIDE_TEXT[edge],
+      unit: column ? '列' : '行',
+      x,
+      y: column ? x : y,
       store: p.store ?? null, // 接了储物仓 / 储液罐的（箱子供货），页面按 stores 写
     }
   })
@@ -2341,6 +2343,7 @@ export function installWorker(self: GeneratorWorkerScope) {
         supply: supplyOf(p),
         storeLayers: Number(p.labstack || 15), // 储物仓最多叠几层：按「研究站最多叠几层」（推断同一个「垂直建造」科技管）
         orient: p.orient || 'h',
+        portPositions: fractionRate > 0 ? undefined : p.portPositions,
         onRound,
         // 同样的输入再点一次「生成蓝图」换一个种子（app.js 记这是第几次）；第一次用规划器默认的种子，和命令行一样
         ...(p.again && p.again > 0 ? { seed: 7 + AGAIN_SEED * p.again } : {}),
@@ -2393,6 +2396,8 @@ export function installWorker(self: GeneratorWorkerScope) {
         }
       }
     }
+    const portIssue = plan.layout.penalties.find((p) => p.kind === 'port-position')
+    if (portIssue) return { error: portIssue.msg }
     return describePlan(plan, calc, p, effort, helpers ? helpers.size : 1, fractionRate)
   }
 
