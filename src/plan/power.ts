@@ -1,0 +1,862 @@
+import { chainTiles } from '../emit/blueprint.js'
+// 供电：布局定下来之后，在空地上放电力感应塔或卫星配电站。这是后处理，不参与摆放搜索。
+//
+// 要覆盖的不只是工厂：分拣器也耗电，看取料的那一头（蓝图里它的第一个坐标，game-rules 第 33 条）。传送带不耗电。
+// 覆盖：工厂/分拣器的中心点在覆盖半径以内就算接通（实测，game-rules 第 9 条）；半径、连接距离按官方米数在赤道上折成格子
+// （一格 1.2566 m，纬度越高格子越窄，按赤道算最保守），比实测略小或一致，不另扣余量（COVER_MARGIN、LINK_MARGIN）。
+//
+// 放在哪：
+//   电力感应塔 1×1：任何没有工厂、地面带、分拣器经过、头顶也没有高架带的空格。
+//   卫星配电站 3×3：九格全空的位置（实测紧挨制造台、熔炉本体也行）；两座要南北隔 6 或东西隔 7（顶盘比底座宽，gamedata.js 的 powerApart）。
+//   卫星配电站的顶盘比底座宽：离中心 2 格那圈里不能有顶盘那一截高度（4.18~5.27 层）的带子（markDisk）。
+//   卫星配电站不进物流站身外那 1 格碰撞圈（gamedata.js 的 STATION_CLEAR，按 9×9 算）；电力感应塔可以贴着站身（实测 D4）。
+//   布局里找不到时，在外沿加一条地，取加得少的一边。
+// 选址是集合覆盖：贪心每次挑能新覆盖最多目标的位置，最后倒序删掉多余的；设施之间超出连接距离时，在两群之间补一座中继。
+import {
+  STATION_CLEAR,
+  STATION_EW,
+  SUBSTATION_DISK,
+  powerCells,
+  powerApart,
+  powerHugs,
+  substationPad,
+  slotPoint,
+} from '../gamedata.js'
+import type { Layout, Tile, Point, PowerType, PowerOptions } from './domain.js'
+import { portRays } from './layout/shared.js'
+
+type PowerGeometry = Pick<
+  Layout,
+  | 'pos'
+  | 'rowCy'
+  | 'segments'
+  | 'legs'
+  | 'ports'
+  | 'sorterList'
+  | 'width'
+  | 'height'
+  | 'stations'
+  | 'chains'
+  | 'stores'
+  | 'coaters'
+  | 'pilers'
+  | 'proLines'
+  | 'warperLinks'
+> & { labGaps?: Layout['labGaps'] | null }
+type Spec = (typeof POWER)[PowerType]
+type XY = Point
+type Ext = { left: number; right: number; bottom: number; top: number }
+type Side = keyof Ext
+type Candidate = XY & { cov?: number[]; set?: Set<number>; side?: Side; ext?: number }
+type Occupancy = ReturnType<typeof occGrid>
+interface Targets {
+  n: number
+  x: number[]
+  y: number[]
+  what: string[]
+  bid: (string | undefined | typeof NOBID)[]
+}
+
+export const CELL_M = 1.2566
+export const POWER = {
+  tesla: { name: '电力感应塔', itemId: 2201, model: 44, size: 1, cover: 10, link: 22 },
+  substation: { name: '卫星配电站', itemId: 2212, model: 68, size: 3, cover: 26, link: 53 },
+}
+export const COVER_MARGIN = 0 // 覆盖：已实测，按中心点判，不扣余量
+export const LINK_MARGIN = 0 // 连接：实测 17 格通、18 格不通，和 22 m ÷ 1.2566 = 17.5 一致，不扣（离赤道远格子窄，同样格数更短，只会更宽裕）
+/** 覆盖半径与连接距离（格） */
+export function powerReach(
+  type: PowerType,
+  { cellM = CELL_M, coverMargin = COVER_MARGIN, linkMargin = LINK_MARGIN }: PowerOptions = {},
+) {
+  const s = POWER[type]
+  return { cover: s.cover / cellM - coverMargin, link: s.link / cellM - linkMargin }
+}
+
+const K = (x: number, y: number) => `${x},${y}`
+
+/**
+ * 被占格子的位图（搜索时每一步都要重建一次，比字符串键的 Set 快得多）：布局四周留 24 格余量，余量外的格子一律当空。
+ * 给了 buf 就借它的前一截（搜索时反复用同一块，省得每步分配）。
+ */
+function occGrid(W: number, H: number, buf: Uint8Array | null = null) {
+  const M = 24
+  const GW = W + 2 * M
+  const GH = H + 2 * M
+  const bits = buf ? buf.subarray(0, GW * GH).fill(0) : new Uint8Array(GW * GH)
+  return {
+    bits,
+    GW,
+    GH,
+    M,
+    add(x: number, y: number) {
+      const gx = x + M
+      const gy = y + M
+      if (gx >= 0 && gy >= 0 && gx < GW && gy < GH) bits[gy * GW + gx] = 1
+    },
+    has(x: number, y: number) {
+      const gx = x + M
+      const gy = y + M
+      return gx >= 0 && gy >= 0 && gx < GW && gy < GH && bits[gy * GW + gx] === 1
+    },
+  }
+}
+
+/** 目标没有 bid 这个键（物流站、喷涂机这些）；有 bid 键、值是 undefined 的照样留着键 */
+const NOBID = Symbol('nobid')
+/** 需要供电的目标：坐标、what、bid 分开按顺序存，搜索时只给落单的那几个生成对象 */
+const sink = (): Targets => ({ n: 0, x: [], y: [], what: [], bid: [] })
+const put = (T: Targets, x: number, y: number, what: string, bid: Targets['bid'][number]) => {
+  const i = T.n++
+  T.x[i] = x
+  T.y[i] = y
+  T.what[i] = what
+  T.bid[i] = bid
+}
+const target = (T: Targets, i: number) =>
+  T.bid[i] === NOBID
+    ? { x: T.x[i], y: T.y[i], what: T.what[i] }
+    : { x: T.x[i], y: T.y[i], what: T.what[i], bid: T.bid[i] as string | undefined }
+
+/**
+ * 被占的格子（不分高度）与需要供电的目标点。power 是供电设施的物品编号（决定能不能贴着工厂本体放）。
+ * 工厂本体左右各多算 1 格（同一行两台之间那 1 格缝也算占用），除非实测过这种设施可以贴着这种工厂放
+ * （gamedata.js 的 powerHugs：电力感应塔贴所有工厂；卫星配电站按 substationPad，第六张体积测试）。rowGaps=true 时一律不多算。
+ */
+export function occupancy(
+  L: PowerGeometry,
+  { rowGaps = false, power = null }: { rowGaps?: boolean; power?: number | null } = {},
+) {
+  const occ = occGrid(L.width, L.height)
+  const T = sink()
+  mark(L, rowGaps, power, occ, T)
+  const targets = []
+  for (let i = 0; i < T.n; i++) targets.push(target(T, i))
+  return { occ, targets }
+}
+
+/**
+ * occupancy 的主体：被占的格子记进 occ，需要供电的目标按顺序记进 T（powerBands 搜索时直接用，不生成目标对象）。
+ * 位图里第 x 列记在第 x + M 列
+ */
+function mark(L: PowerGeometry, rowGaps: boolean, power: number | null, occ: Occupancy, T: Targets) {
+  const { bits, GW, GH, M } = occ
+  const add = (x: number, y: number) => {
+    const gx = x + M
+    const gy = y + M
+    if (gx >= 0 && gy >= 0 && gx < GW && gy < GH) bits[gy * GW + gx] = 1
+  }
+  const cells = (cs: number[][]) => {
+    for (let i = 0; i < cs.length; i++) {
+      const gx = cs[i][0] + M
+      const gy = cs[i][1] + M
+      if (gx >= 0 && gy >= 0 && gx < GW && gy < GH) bits[gy * GW + gx] = 1
+    }
+  }
+  // 第 y 行 x0..x1 这几格，和 for (x = x0; x <= x1; x++) add(x, y) 一样；起点和行号是整数时整段直接写
+  const line = (x0: number, x1: number, y: number) => {
+    const gy = y + M
+    if (!Number.isInteger(x0) || !Number.isInteger(gy)) {
+      for (let x = x0; x <= x1; x++) add(x, y)
+      return
+    }
+    if (gy < 0 || gy >= GH) return
+    const o = gy * GW
+    for (let gx = Math.max(x0 + M, 0), b = Math.min(x1 + M, GW - 1); gx <= b; gx++) bits[o + gx] = 1
+  }
+  for (const p of L.pos.values()) {
+    const cy = L.rowCy[p.row]
+    const hw = ((p.g.bodyWidth ?? 3) - 1) / 2
+    const below = p.g.bodyBelow ?? ((p.g.bodyHeight ?? 3) - 1) / 2
+    const above = (p.g.bodyHeight ?? 3) - 1 - below
+    // 本体外多算几格：卫星配电站按 gamedata.js 的 substationPad（game-rules 第 28 条 S 组）；
+    // 别的设施能贴就不多算，不能贴左右各 1 格（只看工厂种类，同一组每台都一样，提到循环外）
+    const hug = power && powerHugs(power, p.g) ? 0 : 1
+    const sp = rowGaps
+      ? { left: 0, right: 0, below: 0, above: 0 }
+      : power === 2212
+        ? substationPad(p.g).pad
+        : { left: hug, right: hug, below: 0, above: 0 }
+    const exL = sp.below || sp.above ? sp.left : 0
+    const exR = sp.below || sp.above ? sp.right : 0
+    for (const cx of p.centers) {
+      for (let y = cy - below; y <= cy + above; y++) line(cx - hw - sp.left, cx + hw + sp.right, y)
+      for (let k = 1; k <= sp.below; k++) line(cx - hw - exL, cx + hw + exR, cy - below - k)
+      for (let k = 1; k <= sp.above; k++) line(cx - hw - exL, cx + hw + exR, cy + above + k)
+      put(T, cx, cy, p.g.item, p.bid)
+    }
+  }
+  // 带子占的格子：和 chainTiles 列出来的那些格一样，只是不拼数组（搜索时每步都要走一遍）
+  for (const ch of L.chains)
+    for (const part of ch.parts) {
+      if (part.gap != null) {
+        // 研究站夹带（layout/belts.js 的 labGaps）那一列的地面格
+        const gp = L.labGaps![part.gap]
+        for (let y = gp.y0; y <= gp.y1; y++) add(gp.x, y)
+        continue
+      }
+      if (part.leg != null) {
+        const l = L.legs[part.leg]
+        if (l.kind === 'in' || l.kind === 'out') {
+          if (l.stub) cells(l.stub)
+          if (l.kind === 'in' && l.pre) cells(l.pre)
+          if (!l.direct) add(l.edge!, l.py!)
+        }
+        cells(l.cells)
+        continue
+      }
+      const s = L.segments[part.seg]
+      // 和 chainTiles 的 range 一样从一头走到另一头（两头是整数时就是两头之间整段）；劈开的段两半都算
+      const span = (from: number, to: number) => {
+        if (Number.isInteger(from) && Number.isInteger(to))
+          return line(Math.min(from, to), Math.max(from, to), s.y)
+        const step = from <= to ? 1 : -1
+        for (let x = from; step > 0 ? x <= to : x >= to; x += step) add(x, s.y)
+      }
+      if (s.split == null) {
+        if (s.dir > 0) span(s.a, s.b)
+        else span(s.b, s.a)
+      } else {
+        if (s.split > s.a) span(s.split - 1, s.a)
+        span(s.split, s.b)
+      }
+    }
+  // 增产剂带（多半在高架上，塔也不能放在它下面）；喷涂机、自动集装机都要通电
+  for (const pl of L.proLines || []) cells(pl.cells)
+  for (const w of L.warperLinks || []) cells(w.cells) // 翘曲器带
+  for (const d of [...(L.coaters || []), ...(L.pilers || [])])
+    put(T, d.x, d.y, (L.coaters as XY[] | undefined)?.includes(d) ? '喷涂机' : '自动集装机', NOBID)
+  // 箱子供货的储物仓、储液罐（plan/storage.js）：那一块地不放设施；仓口的分拣器、仓顶的物流配送器要通电（配送器要电是推断）
+  for (const b of L.stores || []) {
+    for (let x = b.rect[0]; x <= b.rect[2]; x++)
+      for (let y = b.rect[1]; y <= b.rect[3]; y++) add(x, y)
+    for (const so of b.sorters) put(T, so.p0[0], so.p0[1], '分拣器', NOBID) // p0 是取料端
+    if (b.dist) for (const [x, y] of b.boxes) put(T, x, y, '物流配送器', NOBID)
+  }
+  // 物流站占 7×7，外面还有 1 格碰撞圈（只挡卫星配电站，按 9×9 算），自己也耗电
+  for (const st of L.stations || []) {
+    const c = power === 2212 ? STATION_CLEAR : 3
+    for (let dx = -c; dx <= c; dx++) for (let dy = -c; dy <= c; dy++) add(st.x + dx, st.y + dy)
+    if (power === 2212)
+      for (const sx of [-STATION_EW.x, STATION_EW.x])
+        for (let dy = -STATION_EW.y; dy <= STATION_EW.y; dy++) add(st.x + sx, st.y + dy) // 东西向再让一列（gamedata.js 的 STATION_EW）
+    put(T, st.x, st.y, '物流站', NOBID)
+  }
+  // 同一台工厂的分拣器多半挨着排，上一根的工厂直接拿来用，省一次查表
+  let bid: string | number | symbol = NOBID
+  let p = null
+  for (const s of L.sorterList) {
+    if (s.bid !== bid) p = L.pos.get((bid = s.bid))
+    const seg = L.segments[s.segId!]
+    const edge =
+      s.side === 'bottom'
+        ? L.rowCy[p!.row] - (p!.g.edgeBelow ?? 1)
+        : L.rowCy[p!.row] + (p!.g.edgeAbove ?? 1)
+    const lo = Math.min(edge, seg.y)
+    const hi = Math.max(edge, seg.y)
+    for (let y = lo + 1; y < hi; y++) add(s.col, y)
+    // 覆盖按取料端算，和独立检查一致：进料取带子那头，出料取工厂那头（化工厂下侧落点带 0.284 的小数，研究站、对撞机的分拣器对齐槽位的 x）
+    if (s.stub) continue // 储液罐口那截是带子，不用电
+    const pt = slotPoint(p!.g, s.side, s.col - s.cx)
+    put(T, s.cx + pt.dx, s.io === 'in' ? seg.y : L.rowCy[p!.row] + pt.dy, '分拣器', s.bid)
+  }
+  // 研究站夹带的侧面分拣器（横着、长 1，从研究站往带上放）：取料端是研究站的槽位；手臂压着研究站本体和带子那格，不另占格子
+  if (L.labGaps)
+    for (const gp of L.labGaps) {
+      const q = L.pos.get(gp.bid)
+      for (const t of gp.taps) {
+        const [dx, dy] = q!.g.slotPos![t.slot]
+        put(T, t.cx + dx, L.rowCy[q!.row] + dy, '分拣器', gp.bid)
+      }
+    }
+}
+
+/**
+ * 卫星配电站的顶盘比 3×3 底座宽：离中心 SUBSTATION_DISK.reach（2）格那一圈里，4.18~5.27 层的带子会撞（实测，game-rules 第 38 条）。
+ * occupancy 记格子不分高度，只挡得住底座压着的带子；这里把这种高度的每节带子周围 3×3 也记进 occ，底座和它重叠的中心就不能放。
+ * 只在放卫星配电站时用（placePower、fitPlacement；搜索里的 powerBands 不看高度），带子的范围和 plan/reroute.js 的 diskHits 一样
+ */
+function markDisk(L: Layout, occ: Occupancy) {
+  const r = SUBSTATION_DISK.reach - 1 // 每节带子周围 r 格（3×3），加上底座半宽 1 正好是 reach
+  const scan = (t: Tile[]) => {
+    for (const [x, y, z] of t)
+      if (z > SUBSTATION_DISK.lo && z < SUBSTATION_DISK.hi)
+        for (let dx = -r; dx <= r; dx++) for (let dy = -r; dy <= r; dy++) occ.add(x + dx, y + dy)
+  }
+  for (const ch of L.chains) {
+    const t = chainTiles(L, ch)
+    scan(t.main)
+    for (const e of t.extra) scan(e)
+  }
+  for (const w of L.warperLinks || []) scan(w.cells)
+  for (const p of L.proLines || []) scan(p.cells)
+}
+
+const SIDES: Side[] = ['left', 'right', 'bottom', 'top']
+
+/** 设施中心在 (x, y) 时实际占的格子，以及离中心最远几格（ring） */
+const cellsOf = (spec: Spec, x: number, y: number) => powerCells(spec.itemId, x, y)
+const ringOf = (spec: Spec) => (spec.size - 1) / 2
+/** 同类设施两座能不能这样放（gamedata.js 的 powerApart）：塔之间中心直线距离不小于 2√2；两座配电站要南北隔 6 或东西隔 7（顶盘，第 41 条） */
+export const apart = (spec: Spec, a: XY, b: XY) =>
+  powerApart(spec.itemId, spec.itemId, a.x - b.x, a.y - b.y)
+
+/** 外沿加地后的范围：x ∈ [x0, x1)，y ∈ [y0, y1) */
+const bounds = (W: number, H: number, ext: Ext) => ({
+  x0: -ext.left,
+  x1: W + ext.right,
+  y0: -ext.bottom,
+  y1: H + ext.top,
+})
+
+/**
+ * 某一侧外沿那条地上的设施中心位置（排除挡住边缘出入口的位置）。设施放在加的那条地里，
+ * 每个候选带上它需要加几格宽的地（ext，等于设施边长）。ringOf 留着是为了以后设施实际占地比底座大时，可以往外多挪几格。
+ */
+function bandCands(
+  L: Pick<Layout, 'width' | 'height'>,
+  side: Side,
+  spec: Spec,
+  blocked: Set<string>,
+  occ: Pick<Occupancy, 'has'> = { has: () => false },
+) {
+  const W = L.width
+  const H = L.height
+  const h = (spec.size - 1) / 2
+  const r = ringOf(spec)
+  const out = []
+  for (let k = 1 + h; k <= 1 + r; k++) {
+    const ext = k + r
+    if (side === 'left' || side === 'right') {
+      const x = side === 'left' ? -k : W - 1 + k
+      for (let y = r; y < H - r; y++) out.push({ x, y, ext })
+    } else {
+      const y = side === 'bottom' ? -k : H - 1 + k
+      for (let x = r; x < W - r; x++) out.push({ x, y, ext })
+    }
+  }
+  // 工厂紧贴边缘时，它旁边那 1 格空隙（occ 里算作工厂的）也伸到了外沿，设施不能贴着工厂放
+  return out.filter((c) =>
+    cellsOf(spec, c.x, c.y).every(([x, y]) => !blocked.has(K(x, y)) && !occ.has(x, y)),
+  )
+}
+
+/** 出入口正外面那一格要留给玩家接带子（已经接到物流站的不用留）；从边缘进出的口往外那一行整条都留 */
+function portBlocks(L: Pick<Layout, 'width' | 'height' | 'ports'>) {
+  const b = new Set<string>()
+  for (const p of L.ports || []) {
+    if (p.station != null) continue
+    if (p.x <= 0) b.add(K(p.x - 1, p.y))
+    if (p.x >= L.width - 1) b.add(K(p.x + 1, p.y))
+    if (p.y <= 0) b.add(K(p.x, p.y - 1))
+    if (p.y >= L.height - 1) b.add(K(p.x, p.y + 1))
+  }
+  // 边缘出入口往外那一行整条留空（layout/shared.js 的 portRays）：口不在布局最外一列时，外面那几格也不放设施
+  for (const [x, y] of portRays(L)) b.add(K(x, y))
+  return b
+}
+
+/** powerBands 每步都要用的几块缓冲：位图、每列连了几行空、每行最近的可放格、目标。只在这里借用，不会同时用两次 */
+const BUF = {
+  occ: new Uint8Array(0),
+  cnt: new Int32Array(0),
+  prev: new Int32Array(0),
+  next: new Int32Array(0),
+  T: sink(),
+}
+const grow = <T extends Int32Array | Uint8Array>(a: T, n: number): T =>
+  a.length >= n ? a : new (a.constructor as new (n: number) => T)(Math.ceil(n * 1.5))
+
+/**
+ * 搜索时用的快速估算：哪些工厂/分拣器附近没有空地放供电设施，只能靠外沿加地；
+ * 挑四条边里加地面积最小、又能覆盖它们的组合。
+ * @returns {{ext: {left,right,bottom,top}, extraArea: number, unreachable: number}}
+ */
+export function powerBands(
+  L: PowerGeometry,
+  type: PowerType,
+  opt: PowerOptions = {},
+): NonNullable<Layout['powerPlan']> {
+  const spec = POWER[type]
+  const { cover } = powerReach(type, opt)
+  const W = L.width
+  const H = L.height
+  // 和 occupancy 一样的格子、一样顺序的目标，只是位图借缓冲、目标先不生成对象
+  BUF.occ = grow(BUF.occ, (W + 48) * (H + 48))
+  const occ = occGrid(W, H, BUF.occ)
+  const T = BUF.T
+  T.n = 0
+  const { rowGaps = false } = opt
+  mark(L, rowGaps, spec.itemId, occ, T)
+  const h = (spec.size - 1) / 2
+  const r = ringOf(spec) // 等于 h
+  const band = 1 + h + r // 外沿加地的宽度（等于设施边长）
+  // 能放设施中心的格子（塔 1 格空、配电站 3×3 全空）。塔直接查位图。
+  // 配电站一行一行往上扫：先在这一行数连续空格，得到左右 h 格都空的中心；每列再记这种行往上连了几行，
+  // 连满 2h+1 行，中间那一行的这一格就能放。顺手给这一行做两张表：每一列往左（≤ x）、往右（≥ x）最近的可放格，
+  // 没有记 -1、W（配电站半径大，落单的目标要扫一大片，先备好表）
+  const n = W * H
+  const { bits, GW, M } = occ
+  const table = h > 0
+  let prev = null
+  let next = null
+  if (table) {
+    const span = 2 * h + 1
+    const cnt = (BUF.cnt = grow(BUF.cnt, W))
+    cnt.fill(0, 0, W)
+    prev = BUF.prev = grow(BUF.prev, n)
+    next = BUF.next = grow(BUF.next, n)
+    // 上下各 h 行放不下中心
+    prev.fill(-1, 0, Math.min(n, h * W))
+    next.fill(W, 0, Math.min(n, h * W))
+    prev.fill(-1, Math.max(0, (H - h) * W), n)
+    next.fill(W, Math.max(0, (H - h) * W), n)
+    for (let y = 0; y < H; y++) {
+      const g = (y + M) * GW + M
+      let k = 0
+      for (let x = 0; x < W; x++) {
+        k = bits[g + x] === 1 ? 0 : k + 1
+        if (x >= 2 * h) cnt[x - h] = k >= span ? cnt[x - h] + 1 : 0
+      }
+      if (y < 2 * h) continue
+      const row = (y - h) * W
+      let last = -1
+      for (let x = 0; x < W; x++) prev[row + x] = last = cnt[x] >= span ? x : last
+      last = W
+      for (let x = W - 1; x >= 0; x--) next[row + x] = last = cnt[x] >= span ? x : last
+    }
+  }
+  const R = Math.floor(cover)
+  const r2 = cover * cover
+  // 一个目标附近（外框 [X0, X1] × [Y0, Y1] 里、(x − t.x)² + (y − t.y)² ≤ r²）有没有能放的格：同一行里这个值往 t.x 两边单调不减，
+  // 所以每行只要看 t.x 左边、右边离它最近的那一格可放格（塔：从 t.x 往两边走，走到第一格可放或第一格超出半径为止；配电站：查表）。
+  // 从目标那一行往外找，找到就停。上一个目标找到的那格（wx, wy）先拿来判一下，相邻的目标多半一判就中
+  // （半径不是负数时，外框外的格子一定超出半径，所以这格在半径内就算数）
+  const reuse = cover >= 0
+  let wx = NaN
+  let wy = NaN
+  const near = (tx0: number, ty0: number) => {
+    if (reuse && (wx - tx0) ** 2 + (wy - ty0) ** 2 <= r2) return true
+    const tx = Math.round(tx0)
+    const ty = Math.round(ty0)
+    const X0 = Math.max(0, tx - R - 1)
+    const X1 = Math.min(W - 1, tx + R + 1)
+    const Y0 = Math.max(0, ty - R - 1)
+    const Y1 = Math.min(H - 1, ty + R + 1)
+    if (!(X0 <= X1 && Y0 <= Y1)) return false
+    const xr = Math.max(X0, Math.ceil(tx0)) // 右边从这一列找起
+    const xl = Math.min(X1, Math.floor(tx0)) // 左边从这一列找起
+    const hit = (y: number) => {
+      const dy2 = (y - ty0) ** 2
+      let x = -1
+      if (table) {
+        const row = y * W
+        if (xr <= X1 && next![row + xr] <= X1 && (next![row + xr] - tx0) ** 2 + dy2 <= r2)
+          x = next![row + xr]
+        else if (xl >= X0 && prev![row + xl] >= X0 && (prev![row + xl] - tx0) ** 2 + dy2 <= r2)
+          x = prev![row + xl]
+      } else {
+        const g = (y + M) * GW + M
+        for (let c = xr; x < 0 && c <= X1 && (c - tx0) ** 2 + dy2 <= r2; c++)
+          if (bits[g + c] !== 1) x = c
+        for (let c = xl; x < 0 && c >= X0 && (c - tx0) ** 2 + dy2 <= r2; c--)
+          if (bits[g + c] !== 1) x = c
+      }
+      if (x < 0) return false
+      wx = x
+      wy = y
+      return true
+    }
+    for (let d = 0, D = Math.max(Y1 - ty, ty - Y0); d <= D; d++) {
+      if (ty + d >= Y0 && ty + d <= Y1 && hit(ty + d)) return true
+      if (d && ty - d >= Y0 && ty - d <= Y1 && hit(ty - d)) return true
+    }
+    return false
+  }
+  const lonely = []
+  for (let i = 0; i < T.n; i++) if (!near(T.x[i], T.y[i])) lonely.push(target(T, i))
+  const none = { left: 0, right: 0, bottom: 0, top: 0 }
+  if (!lonely.length) return { ext: none, extraArea: 0, unreachable: 0, lonely }
+  // 每条边能够着哪些：设施中心离这条边外面那条地的距离 ≤ 覆盖半径（沿边方向随便挪）
+  const reach: Record<Side, (t: XY) => boolean> = {
+    left: (t) => t.x + 1 + h <= cover,
+    right: (t) => W + h - t.x <= cover,
+    bottom: (t) => t.y + 1 + h <= cover,
+    top: (t) => H + h - t.y <= cover,
+  }
+  // 每个落单的目标能被哪几条边够着，按 SIDES 的顺序记成 4 位；下面 16 种加地组合只数位
+  const sides = lonely.map((t) => SIDES.reduce((a, sd, i) => (reach[sd](t) ? a | (1 << i) : a), 0))
+  let best = null
+  for (let m = 0; m < 16; m++) {
+    const ext = { ...none }
+    SIDES.forEach((sd, i) => (ext[sd] = m & (1 << i) ? band : 0))
+    if (opt.maxWidth && W + ext.left + ext.right > opt.maxWidth && (ext.left || ext.right)) continue // 限宽时不往左右加地
+    if (opt.maxHeight && H + ext.bottom + ext.top > opt.maxHeight && (ext.bottom || ext.top))
+      continue // 限长时不往上下加地
+    let miss = 0
+    for (const s of sides) if (!(s & m)) miss++
+    const extraArea = (W + ext.left + ext.right) * (H + ext.bottom + ext.top) - W * H
+    if (
+      !best ||
+      miss < best.unreachable ||
+      (miss === best.unreachable && extraArea < best.extraArea)
+    )
+      best = { ext, extraArea, unreachable: miss, lonely }
+  }
+  return best!
+}
+
+/**
+ * @param L route() 的布局
+ * @param {'tesla'|'substation'} type
+ * @returns {{type, itemId, model, size, nodes: {x,y}[], extend: {left,right,bottom,top}, uncovered: number, warnings: string[]}}
+ */
+export function placePower(L: Layout, type: PowerType, opt: PowerOptions = {}) {
+  const spec = POWER[type]
+  if (!spec) throw new Error(`未知供电方式 ${type}`)
+  const { cover, link } = powerReach(type, opt)
+  const { occ, targets } = occupancy(L, { ...opt, power: spec.itemId })
+  if (spec.itemId === 2212) markDisk(L, occ) // 顶盘那一圈让开 4.18~5.27 层的带子
+  const W = L.width
+  const H = L.height
+  const h = (spec.size - 1) / 2
+  const blocked = portBlocks(L)
+  const r2 = cover * cover
+  // 一个位置覆盖哪些目标（下标从小到大）。目标按 BS 格见方分桶，只看覆盖半径多算 1 格以内的那几桶（半径内的目标一定落在这几桶里），
+  // 最后按下标排序。坐标不是有限数的目标谁也覆盖不到，不进桶
+  const BS = 8
+  const finite = (t: XY) => Number.isFinite(t.x) && Number.isFinite(t.y)
+  let tx0 = Infinity
+  let ty0 = Infinity
+  let tx1 = -Infinity
+  let ty1 = -Infinity
+  for (const t of targets) {
+    if (!finite(t)) continue
+    tx0 = Math.min(tx0, t.x)
+    ty0 = Math.min(ty0, t.y)
+    tx1 = Math.max(tx1, t.x)
+    ty1 = Math.max(ty1, t.y)
+  }
+  const nbx = tx0 <= tx1 ? Math.floor((tx1 - tx0) / BS) + 1 : 0
+  const nby = ty0 <= ty1 ? Math.floor((ty1 - ty0) / BS) + 1 : 0
+  const buckets: number[][] = Array.from({ length: nbx * nby }, () => [])
+  targets.forEach((t, i) => {
+    if (finite(t)) buckets[Math.floor((t.y - ty0) / BS) * nbx + Math.floor((t.x - tx0) / BS)].push(i)
+  })
+  const CR = Math.abs(cover) + 1 // 判断式里是半径的平方，半径按绝对值算
+  const covers = (c: XY) => {
+    const out = []
+    const bx0 = Math.max(0, Math.floor((c.x - CR - tx0) / BS))
+    const bx1 = Math.min(nbx - 1, Math.floor((c.x + CR - tx0) / BS))
+    const by0 = Math.max(0, Math.floor((c.y - CR - ty0) / BS))
+    const by1 = Math.min(nby - 1, Math.floor((c.y + CR - ty0) / BS))
+    for (let by = by0; by <= by1; by++)
+      for (let bx = bx0; bx <= bx1; bx++)
+        for (const i of buckets[by * nbx + bx]) {
+          const t = targets[i]
+          if ((t.x - c.x) ** 2 + (t.y - c.y) ** 2 <= r2) out.push(i)
+        }
+    return out.sort((a, b) => a - b)
+  }
+  /**
+   * 贪心选址：每轮挑能新覆盖最多目标的位置（一样多时挑离已选设施更远的，免得扎堆；再一样挑靠前的），和已有的、已选的设施都要隔够距离（apart）。
+   * 每个位置还能新覆盖几个（cnt）、隔得够不够（ok）、离已选设施最近的距离平方（sp）都随选中一座增量更新（sp 还没选时是 +∞，比不出大小）
+   */
+  const greedy = (cands: Candidate[], need: Set<number>, have: Candidate[] = []) => {
+    for (const c of cands) c.cov ??= covers(c)
+    const picked = []
+    const m = cands.length
+    const cnt = new Int32Array(m)
+    const ok = new Uint8Array(m)
+    const sp = new Float64Array(m).fill(Infinity)
+    const rev = new Map<number, number[]>() // 目标 → 覆盖它的位置（从小到大）
+    for (let k = 0; k < m; k++) {
+      const c = cands[k]
+      ok[k] = have.every((p) => apart(spec, p, c)) ? 1 : 0 // 两座配电站离太近
+      for (const i of c.cov!) {
+        if (need.has(i)) cnt[k]++
+        let r = rev.get(i)
+        if (!r) rev.set(i, (r = []))
+        r.push(k)
+      }
+    }
+    while (need.size) {
+      let best = -1
+      let bn = 0
+      for (let k = 0; k < m; k++) {
+        if (!ok[k]) continue
+        const n = cnt[k]
+        if (n > bn || (n === bn && n > 0 && best >= 0 && sp[k] > sp[best])) {
+          best = k
+          bn = n
+        }
+      }
+      if (best < 0) break
+      const b = cands[best]
+      picked.push(b)
+      for (const i of b.cov!) if (need.delete(i)) for (const k of rev.get(i)!) cnt[k]--
+      for (let k = 0; k < m; k++) {
+        const c = cands[k]
+        if (ok[k] && !apart(spec, b, c)) ok[k] = 0
+        const d2 = (b.x - c.x) ** 2 + (b.y - c.y) ** 2
+        if (d2 < sp[k]) sp[k] = d2
+      }
+    }
+    return picked
+  }
+  // 设施实际占的格子（powerCells：配电站 3×3）都在外框里、都空着
+  const freeIn = (x: number, y: number, b: ReturnType<typeof bounds>) =>
+    cellsOf(spec, x, y).every(
+      ([cx, cy]) =>
+        cx >= b.x0 &&
+        cy >= b.y0 &&
+        cx < b.x1 &&
+        cy < b.y1 &&
+        !occ.has(cx, cy) &&
+        !blocked.has(K(cx, cy)),
+    )
+  const inner: Candidate[] = []
+  const b0 = bounds(W, H, { left: 0, right: 0, bottom: 0, top: 0 })
+  for (let x = 0; x < W; x++) for (let y = 0; y < H; y++) if (freeIn(x, y, b0)) inner.push({ x, y })
+  const need = new Set(targets.map((_, i) => i))
+  // 搜索时在行里挪开工厂挖出来的配电站空位（layout/powerholes.js）都放上、后面也不删：空位是为它挪的，不放就白留一段缝；
+  // 还没覆盖的再在所有空地里挑
+  let nodes: Candidate[] = []
+  for (const h of L.powerHoles ?? []) {
+    if (!(h.shift > 0)) continue
+    const c = inner.find((q) => q.x === h.x && q.y === L.rowCy[h.row])
+    if (!c || !nodes.every((p) => apart(spec, p, c))) continue
+    c.cov ??= covers(c)
+    for (const i of c.cov) need.delete(i)
+    nodes.push(c)
+  }
+  const fixed = new Set(nodes)
+  nodes = nodes.concat(greedy(inner, need, nodes))
+  const extend = { left: 0, right: 0, bottom: 0, top: 0 }
+  if (need.size) {
+    // 布局里够不着的，用估算挑出的那几条边的外沿
+    const plan = powerBands(L, type, opt)
+    const add = (sides: Side[]) => {
+      const cands = sides.flatMap((sd) =>
+        bandCands(L, sd, spec, blocked, occ).map((c) => ({ ...c, side: sd })),
+      )
+      const got = greedy(cands, need, nodes)
+      nodes = nodes.concat(got)
+      for (const c of got) extend[c.side!] = Math.max(extend[c.side!], c.ext!)
+    }
+    add(SIDES.filter((sd) => plan.ext[sd]))
+    // 估算挑的边上没有空位（比如被出入口挡住）时，再试别的边；限宽 / 限长时不往那个方向加地
+    const band = 1 + h + ringOf(spec)
+    const fits = (sd: Side) =>
+      sd === 'left' || sd === 'right'
+        ? !opt.maxWidth || W + band <= opt.maxWidth
+        : !opt.maxHeight || H + band <= opt.maxHeight
+    if (need.size) add(SIDES.filter((sd) => !plan.ext[sd] && fits(sd)))
+  }
+  // 倒序删掉多余的：它覆盖的目标别的设施都覆盖了
+  const count = new Map<number, number>()
+  for (const c of nodes) for (const i of c.cov!) count.set(i, (count.get(i) || 0) + 1)
+  for (let j = nodes.length - 1; j >= 0; j--) {
+    const c = nodes[j]
+    if (!fixed.has(c) && c.cov!.every((i) => count.get(i)! > 1)) {
+      for (const i of c.cov!) count.set(i, count.get(i)! - 1)
+      nodes.splice(j, 1)
+    }
+  }
+  // 2 换 1：两座设施各自独占的目标，如果某个空位能全部覆盖，就换成那一座。反复做到换不动为止
+  if (opt.localSearch !== false) {
+    const pool = inner.concat(nodes.filter((n) => n.side))
+    // 目标 → 覆盖它的空位（按 pool 里的先后）：要找的空位必定覆盖 only[0]，只在覆盖 only[0] 的那些里按先后找第一个满足条件的。
+    // 目标集合（set）用到时才建
+    const revPool = new Map<number, number[]>()
+    pool.forEach((c, k) => {
+      c.cov ??= covers(c)
+      for (const i of c.cov) {
+        let r = revPool.get(i)
+        if (!r) revPool.set(i, (r = []))
+        r.push(k)
+      }
+    })
+    const setOf = (c: Candidate) => (c.set ??= new Set(c.cov))
+    for (const c of nodes) setOf(c)
+    const cnt = new Map<number, number>()
+    for (const c of nodes) for (const i of c.cov!) cnt.set(i, (cnt.get(i) || 0) + 1)
+    const reach2 = (2 * cover) ** 2
+    let again = true
+    while (again) {
+      again = false
+      outer: for (let a = 0; a < nodes.length; a++)
+        for (let b = a + 1; b < nodes.length; b++) {
+          const A = nodes[a]
+          const B = nodes[b]
+          if (fixed.has(A) || fixed.has(B) || (A.x - B.x) ** 2 + (A.y - B.y) ** 2 > reach2) continue
+          const only: number[] = []
+          for (const i of A.cov!) if (cnt.get(i)! - 1 - (B.set!.has(i) ? 1 : 0) === 0) only.push(i)
+          for (const i of B.cov!) if (!A.set!.has(i) && cnt.get(i) === 1) only.push(i)
+          const fit = (c: Candidate) =>
+            c !== A &&
+            c !== B &&
+            only.every((i) => setOf(c).has(i)) &&
+            !nodes.some((n) => n !== A && n !== B && !apart(spec, n, c))
+          let sub
+          if (only.length) {
+            for (const k of revPool.get(only[0]) ?? [])
+              if (fit(pool[k])) {
+                sub = pool[k]
+                break
+              }
+          } else sub = pool.find(fit)
+          if (!sub) continue
+          setOf(sub) // 换上去的设施以后当 A、B 用
+          for (const i of A.cov!) cnt.set(i, cnt.get(i)! - 1)
+          for (const i of B.cov!) cnt.set(i, cnt.get(i)! - 1)
+          for (const i of sub.cov!) cnt.set(i, (cnt.get(i) || 0) + 1)
+          nodes.splice(b, 1)
+          nodes.splice(a, 1, sub)
+          again = true
+          break outer
+        }
+    }
+    // 再删一次多余的
+    for (let j = nodes.length - 1; j >= 0; j--) {
+      const c = nodes[j]
+      if (!fixed.has(c) && c.cov!.every((i) => cnt.get(i)! > 1)) {
+        for (const i of c.cov!) cnt.set(i, cnt.get(i)! - 1)
+        nodes.splice(j, 1)
+      }
+    }
+  }
+  for (const sd of SIDES)
+    extend[sd] = Math.max(0, ...nodes.filter((n) => n.side === sd).map((n) => n.ext!))
+  // 连通：超出连接距离的几群之间补中继
+  const b1 = bounds(W, H, extend)
+  const l2 = link * link
+  const warnings = []
+  for (let guard = 0; guard < 20; guard++) {
+    const comp = new Array<number>(nodes.length).fill(-1)
+    let nc = 0
+    for (let i = 0; i < nodes.length; i++) {
+      if (comp[i] >= 0) continue
+      const st = [i]
+      comp[i] = nc
+      while (st.length) {
+        const a = st.pop()
+        for (let b = 0; b < nodes.length; b++)
+          if (
+            comp[b] < 0 &&
+            (nodes[a!].x - nodes[b].x) ** 2 + (nodes[a!].y - nodes[b].y) ** 2 <= l2
+          ) {
+            comp[b] = nc
+            st.push(b)
+          }
+      }
+      nc++
+    }
+    if (nc <= 1) break
+    let pair = null
+    for (let a = 0; a < nodes.length; a++)
+      for (let b = 0; b < nodes.length; b++)
+        if (comp[a] === 0 && comp[b] > 0) {
+          const d = (nodes[a].x - nodes[b].x) ** 2 + (nodes[a].y - nodes[b].y) ** 2
+          if (!pair || d < pair.d) pair = { a: nodes[a], b: nodes[b], d }
+        }
+    let relay = null
+    for (let x = b1.x0; x < b1.x1; x++)
+      for (let y = b1.y0; y < b1.y1; y++) {
+        if (!freeIn(x, y, b1) || nodes.some((n) => !apart(spec, n, { x, y }))) continue
+        const da = (x - pair!.a.x) ** 2 + (y - pair!.a.y) ** 2
+        const db = (x - pair!.b.x) ** 2 + (y - pair!.b.y) ** 2
+        if (da <= l2 && db <= l2 && (!relay || Math.max(da, db) < relay.m))
+          relay = { x, y, m: Math.max(da, db) }
+      }
+    if (!relay) {
+      warnings.push(`${spec.name}分成了互不相连的几群，找不到放中继的空地，贴好后请手动补一座`)
+      break
+    }
+    nodes.push({ x: relay.x, y: relay.y, cov: [] })
+  }
+  if (need.size) warnings.push(`有 ${need.size} 个工厂/分拣器不在${spec.name}范围内`)
+  return {
+    options: { rowGaps: !!opt.rowGaps },
+    type,
+    name: spec.name,
+    itemId: spec.itemId,
+    model: spec.model,
+    size: spec.size,
+    cover,
+    link,
+    nodes: nodes.map(({ x, y }) => ({ x, y })),
+    extend,
+    uncovered: need.size,
+    warnings,
+  }
+}
+
+/**
+ * 给定的一组设施位（后处理重走时接站后先选好、一路跟着布局平移过来的那一组，plan/reroute.js 的 L.powerReserve）在现在的布局上还能不能原样用：
+ * 每座占的格都在布局里、空着、不挡出入口，两两隔够，要供电的目标都覆盖到，设施之间连得通（不补中继）。能用就照 placePower 的格式返回，不能用 null
+ */
+export function fitPlacement(L: Layout, type: PowerType, nodes: XY[], opt: PowerOptions = {}) {
+  const spec = POWER[type]
+  if (!spec || !nodes?.length) return null
+  const { cover, link } = powerReach(type, opt)
+  const { occ, targets } = occupancy(L, { ...opt, power: spec.itemId })
+  if (spec.itemId === 2212) markDisk(L, occ) // 和 placePower 一样，顶盘那一圈有 4.18~5.27 层的带子就不能原样用
+  const blocked = portBlocks(L)
+  for (const n of nodes)
+    for (const [x, y] of cellsOf(spec, n.x, n.y))
+      if (x < 0 || y < 0 || x >= L.width || y >= L.height || occ.has(x, y) || blocked.has(K(x, y)))
+        return null
+  for (let i = 0; i < nodes.length; i++)
+    for (let j = i + 1; j < nodes.length; j++) if (!apart(spec, nodes[i], nodes[j])) return null
+  const r2 = cover * cover
+  if (targets.some((t) => !nodes.some((n) => (n.x - t.x) ** 2 + (n.y - t.y) ** 2 <= r2))) return null
+  const l2 = link * link
+  const seen = new Set([0])
+  const st = [0]
+  while (st.length) {
+    const a = st.pop()
+    for (let b = 0; b < nodes.length; b++)
+      if (!seen.has(b) && (nodes[a!].x - nodes[b].x) ** 2 + (nodes[a!].y - nodes[b].y) ** 2 <= l2) {
+        seen.add(b)
+        st.push(b)
+      }
+  }
+  if (seen.size !== nodes.length) return null
+  return {
+    options: { rowGaps: !!opt.rowGaps },
+    type,
+    name: spec.name,
+    itemId: spec.itemId,
+    model: spec.model,
+    size: spec.size,
+    cover,
+    link,
+    nodes: nodes.map(({ x, y }) => ({ x, y })),
+    extend: { left: 0, right: 0, bottom: 0, top: 0 },
+    uncovered: 0,
+    warnings: [],
+  }
+}
+
+/**
+ * 放好供电，并把外沿加地计入布局尺寸（就地修改 L）。
+ * 左侧、下方加地时坐标原点不动，设施坐标为负；出蓝图时整体平移 L.origin。
+ * P：已经选好的（placePower / fitPlacement 的结果），不给就照旧现选
+ */
+export function addPower(
+  L: Layout,
+  type: PowerType | 'none' | null,
+  opt: PowerOptions,
+  P: ReturnType<typeof placePower> | null = null,
+) {
+  if (!type || type === 'none') return L
+  if (!P) P = placePower(L, type, opt)
+  L.power = P
+  const e = P.extend
+  L.origin = { x: e.left, y: e.bottom }
+  L.width += e.left + e.right
+  L.height += e.bottom + e.top
+  L.area = L.width * L.height
+  return L
+}

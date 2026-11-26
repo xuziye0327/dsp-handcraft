@@ -1,0 +1,866 @@
+// 分馏塔阵列（做重氢）：从游戏里在用的 60 塔阵列（template.ts，下面叫「原图」）裁剪出来，不重新排。
+//
+// 原图 36×73，右边中间一座星际物流站，上下两半，每半两组「对列」，一共四个氢循环：
+//   一组对列 = 左列 8 座分馏塔（朝右，氢从下往上穿过）+ 右列 7 座（朝左，氢从上往下穿过），两列中间一条收集带，
+//   两边分馏塔侧面出来的重氢都汇进去。氢在一组对列里绕一圈：出右列后过两台自动集装机重新叠成 4 层，
+//   和站里新送来的氢（先过喷涂机喷增产剂、再过两台集装机）汇合，再进左列。
+//   每半边两条收集带各过一台集装机，在四向分流器汇成一条，喷上增产剂进站。
+//   分馏塔的口：1 号是输入（背面），2 号是直通（正面，没分馏的氢接着往下一座走），0 号是产物（侧面，重氢）。
+//
+// 生成时：按要的重氢产量算塔数 → 挑几个循环（离站最近的先用）→ 每个循环留最靠近站的塔、多余的换成直带 →
+// 删掉没用的循环、站口、电塔 → 压紧（compact.ts：删只剩直带的行、列，站往循环那边剪切，删多余电塔、重放电塔，每步查建造盒碰撞）→
+// 裁掉空出来的边。有宽、长、长宽比上限时每份从 4 个循环往少了试，取第一个放得下的。
+// 照原图竖着出（塔距 4 格在南北向）：东西向格子离开赤道会变窄（game-rules 第 26 条），南北向不变。整张转 90° 横着出（orient 'h'）以后
+// 塔距和循环两头最外面那条带（离塔心 2 格）都到了东西向，离开赤道就撞塔（game-rules 第 42 条），所以默认不转。
+import { fromStr, toStr } from '../codec/parser.ts'
+import type { Blueprint, Building, Point2, Point3 } from '../codec/types.ts'
+import { rotateBlueprint } from '../emit/rotate.ts'
+import { narrowestEW } from '../gamedata.ts'
+import { POWER, powerReach } from '../plan/power.ts'
+import { compact, collisions } from './compact.ts'
+import { TEMPLATE } from './template.ts'
+interface LoopInfo {
+  key: string
+  slot: number
+  half: string
+  name: string
+}
+interface AnalyzedLoop extends LoopInfo {
+  entry: Building[]
+  fracs: Building[]
+  order: Building[]
+}
+type Limit = 'width' | 'height' | 'aspect'
+interface Trial {
+  loops: number
+  copies: number
+  per: number
+  width: number
+  height: number
+  over: Limit[]
+}
+interface Limits {
+  maxWidth: number | null
+  maxHeight: number | null
+  maxAspect: number | null
+  fit: boolean
+  by: Limit[]
+  tried: Trial[]
+}
+interface Options {
+  spray?: number
+  perTower?: number
+  title?: string
+  orient?: 'v' | 'h'
+  maxWidth?: number | null
+  maxHeight?: number | null
+  maxAspect?: number | null
+}
+type BuildOptions = Required<Pick<Options, 'spray' | 'perTower' | 'orient'>> & Pick<Options, 'title'>
+interface ModelInput {
+  buildings: Building[]
+  tags: Map<number, string>
+  width: number
+  height: number
+  rotated?: boolean
+  spray?: number
+  fracs: number
+  plan: { perTower: number }
+}
+function addBelt(map: Map<number, Building[]>, key: number, b: Building) {
+  const belts = map.get(key)
+  if (belts) belts.push(b)
+  else map.set(key, [b])
+}
+
+const ST = 2104
+const FRAC = 2314
+const PILER = 2040
+const COATER = 2313
+const SPLIT = 2020
+const TESLA = 2201
+const H = 1120 // 氢
+const D = 1121 // 重氢
+const PRO = 1143 // 增产剂 Mk.III
+const isBelt = (b: Building) => b.itemId >= 2001 && b.itemId <= 2003
+const R = (b: Building): Point3 => ({
+  x: Math.round(b.localOffset[0].x),
+  y: Math.round(b.localOffset[0].y),
+  z: Math.round(b.localOffset[0].z),
+})
+
+/** 站的出站口 → 循环。上半：9 号口接左边一组（A），8 号口接右边一组（B）；下半：11 号口（C）、0 号口（D） */
+export const LOOPS: LoopInfo[] = [
+  { key: 'B', slot: 8, half: 'U', name: '上半右组' },
+  { key: 'A', slot: 9, half: 'U', name: '上半左组' },
+  { key: 'D', slot: 0, half: 'L', name: '下半右组' },
+  { key: 'C', slot: 11, half: 'L', name: '下半左组' },
+]
+const SLOT_IN = { U: 7, L: 1 } // 重氢进站口
+const SLOT_PRO = 5 // 增产剂出站口
+export const TOWERS_PER_LOOP = 15
+export const MAX_TOWERS = TOWERS_PER_LOOP * LOOPS.length
+/**
+ * 每座分馏塔每分钟出多少重氢 = 流过它的氢 × 分馏概率（game-rules 第 13 条）。
+ *   流速：极速带集装 4 层 7200/分（实测单塔接近 7200/分）。
+ *   概率：不喷 1%；喷增产剂按「加速」算，Mk.I 1.25%、Mk.II 1.5%（实测）、Mk.III 2%（BWIKI）。
+ */
+export const FLOW = 7200
+export const SPRAY = [
+  { level: 0, name: '不喷', item: 0, p: 0.01 },
+  { level: 1, name: '增产剂 Mk.I', item: 1141, p: 0.0125 },
+  { level: 2, name: '增产剂 Mk.II', item: 1142, p: 0.015 },
+  { level: 3, name: '增产剂 Mk.III', item: 1143, p: 0.02 },
+]
+export const perTowerOf = (spray = 3) => FLOW * SPRAY[spray].p
+export const PER_TOWER = perTowerOf(3)
+
+/** 解析原图：给每座建筑标上它属于哪个循环（A~D）、哪半边共用（U/L）、增产剂（P）、站（S）或电塔（T） */
+export function analyzeTemplate(B: Building[]) {
+  const station = B.find((b) => b.itemId === ST)
+  if (!station) throw Error('分馏阵列模板缺少物流站')
+  const fedBy = new Map<number, Building[]>() // 设备 → 它送出的带子
+  for (const b of B) if (isBelt(b) && b.inputObjIdx >= 0) addBelt(fedBy, b.inputObjIdx, b)
+  const preds = new Map<number, Building[]>() // 带子 → 前一节带子
+  for (const b of B)
+    if (isBelt(b) && b.outputObjIdx >= 0 && isBelt(B[b.outputObjIdx]))
+      addBelt(preds, b.outputObjIdx, b)
+  const tag = new Map<number, string>()
+  const next = (b: Building, slots?: number[] | null) =>
+    isBelt(b)
+      ? b.outputObjIdx >= 0
+        ? [B[b.outputObjIdx]]
+        : []
+      : (fedBy.get(b.index) ?? []).filter((x) => !slots || slots.includes(x.inputFromSlot))
+  const walk = (
+    starts: Building[],
+    t: string,
+    {
+      stop = () => false,
+      fracSlots = [2],
+    }: { stop?: (b: Building) => boolean; fracSlots?: number[] } = {},
+  ) => {
+    const seen = []
+    const st = [...starts]
+    while (st.length) {
+      const b = st.pop()!
+      if (tag.has(b.index) || b.itemId === ST || stop(b)) continue
+      tag.set(b.index, t)
+      seen.push(b)
+      st.push(...next(b, b.itemId === FRAC ? fracSlots : null))
+    }
+    return seen
+  }
+  const loops = new Map<string, AnalyzedLoop>()
+  for (const lp of LOOPS) {
+    const starts = (fedBy.get(station.index) ?? []).filter((b) => b.inputFromSlot === lp.slot)
+    const hNet = walk(starts, lp.key)
+    const fracs = hNet.filter((b) => b.itemId === FRAC)
+    loops.set(lp.key, { ...lp, entry: starts, fracs, order: [] })
+  }
+  // 重氢：每座塔 0 号口出来，到四向分流器为止归这个循环；分流器到站归半边共用
+  for (const lp of loops.values()) {
+    for (const f of lp.fracs)
+      walk(
+        (fedBy.get(f.index) ?? []).filter((b) => b.inputFromSlot === 0),
+        lp.key,
+        { stop: (b) => b.itemId === SPLIT },
+      )
+  }
+  for (const x of B.filter((b) => b.itemId === SPLIT)) {
+    const into = B.filter((b) => isBelt(b) && b.outputObjIdx === x.index).map((b) =>
+      tag.get(b.index),
+    )
+    const half = LOOPS.find((l) => into.includes(l.key))?.half ?? '?'
+    walk([x], half)
+  }
+  walk(
+    (fedBy.get(station.index) ?? []).filter((b) => b.inputFromSlot === SLOT_PRO),
+    'P',
+  )
+  tag.set(station.index, 'S')
+  // 喷涂机按它压着的那节带子归属；电塔单独处理
+  const beltAt = new Map<string, Building>()
+  for (const b of B) if (isBelt(b) && R(b).z === 0) beltAt.set(`${R(b).x},${R(b).y}`, b)
+  for (const b of B) {
+    if (b.itemId === COATER) {
+      const belt = beltAt.get(`${R(b).x},${R(b).y}`)
+      tag.set(b.index, (belt && tag.get(belt.index)) ?? '?')
+    }
+    if (b.itemId === TESLA) tag.set(b.index, 'T')
+  }
+  // 每个循环里分馏塔的先后：从入口那座起，顺着 2 号口（直通）一座接一座
+  for (const lp of loops.values()) {
+    const set = new Set(lp.fracs.map((f) => f.index))
+    const has = new Set(lp.fracs.map((f) => f.index))
+    // 入口那座：从站口出发、不经过别的分馏塔最先到的那座
+    let first = null
+    {
+      const st = [...lp.entry]
+      const seen = new Set<number>()
+      while (st.length && !first) {
+        const b = st.shift()!
+        if (seen.has(b.index)) continue
+        seen.add(b.index)
+        if (b.itemId === FRAC && has.has(b.index)) first = b
+        else if (b.itemId !== FRAC) st.push(...next(b))
+      }
+    }
+    let cur: Building | null = first
+    while (cur && set.has(cur.index)) {
+      lp.order.push(cur)
+      set.delete(cur.index)
+      let b: Building | null | undefined = (fedBy.get(cur.index) ?? []).find(
+        (x) => x.inputFromSlot === 2,
+      )
+      cur = null
+      while (b && isBelt(b)) b = b.outputObjIdx >= 0 ? B[b.outputObjIdx] : null
+      if (b && b.itemId === FRAC) cur = b
+    }
+  }
+  const untagged = B.filter((b) => !tag.has(b.index))
+  return { station, tag, loops, fedBy, preds, untagged }
+}
+
+/**
+ * 要 n 座塔：分几份粘贴、每份几座、用哪几个循环、每个循环几座；maxLoops：每份最多几个循环（尺寸上限放不下时往少了试）；
+ * loopCount：每份用几个循环（默认够装下的最少几个；多给的每个循环分得少几座）
+ */
+export function arrayPlan(
+  rate: number,
+  perTower = PER_TOWER,
+  maxLoops = LOOPS.length,
+  loopCount: number | null = null,
+) {
+  const towers = Math.max(1, Math.ceil(rate / perTower - 1e-9))
+  const copies = Math.ceil(towers / (TOWERS_PER_LOOP * maxLoops))
+  const per = Math.ceil(towers / copies)
+  const nLoops = Math.min(
+    LOOPS.length,
+    per,
+    Math.max(Math.ceil(per / TOWERS_PER_LOOP), loopCount ?? 0),
+  )
+  const base = Math.floor(per / nLoops)
+  const extra = per % nLoops
+  const loops = LOOPS.slice(0, nLoops).map((l, i) => ({
+    key: l.key,
+    towers: base + (i < extra ? 1 : 0),
+  }))
+  return { towers, copies, per, loops, perTower, rate: per * perTower * copies }
+}
+
+/**
+ * 生成分馏阵列蓝图。
+ * @param {number} rate 想要的重氢产量（个/分钟）
+ * @param {object} [o]
+ * @param {number} [o.spray=3] 氢喷什么增产剂：0 不喷，1~3 Mk.I~Mk.III（决定分馏概率和站里存哪种增产剂）
+ * @param {number} [o.perTower] 每座塔每分钟出多少重氢（默认 7200 × 概率）
+ * @param {'v'|'h'} [o.orient='v'] 'v' 照原图竖着出，任何纬度都能贴；'h' 横着出：比宽还长就整张顺时针转 90°（同 emit/rotate.ts），站到下边，
+ *   只在赤道附近贴得上（见文件头），checkArray 会把离开赤道才撞的报出来
+ * @param {number} [o.maxWidth] [o.maxHeight] [o.maxAspect] 出出来的宽、长、长边比短边的上限：每份从 4 个循环往少了试，取第一个放得下的；
+ *   都放不下就用 1 个循环的那种、notes 里说一声。plan.limits 记着上限、试过哪几种、被哪条卡住
+ * 每份的塔数要 3 个循环（31~45 塔）时，3 个、4 个循环各排一遍，放得下上限的里面挑面积小的（一样大挑 3 个）：3 个循环空着下半边左组那一角，
+ *   4 个循环每个少几座、列短一截，面积更小（1、2 个循环只用上半边，没有空角，多用循环都更大）
+ * @returns {{str: string, plan: object, buildings: object[], width: number, height: number, tags: Map, notes: string[], rotated: boolean}}
+ */
+export function fractionatorArray(
+  rate: number,
+  {
+    spray = 3,
+    perTower = perTowerOf(spray),
+    title,
+    orient = 'v',
+    maxWidth = null,
+    maxHeight = null,
+    maxAspect = null,
+  }: Options = {},
+) {
+  const over = (r: { width: number; height: number }): Limit[] =>
+    (
+      [
+        maxWidth != null && r.width > maxWidth && 'width',
+        maxHeight != null && r.height > maxHeight && 'height',
+        maxAspect != null &&
+          Math.max(r.width, r.height) / Math.min(r.width, r.height) > maxAspect + 1e-9 &&
+          'aspect',
+      ] as const
+    ).filter((k): k is Limit => Boolean(k))
+  const tried: Trial[] = []
+  let r: ReturnType<typeof buildArray> | undefined
+  for (let k = LOOPS.length; k >= 1; k--) {
+    const plan = arrayPlan(rate, perTower, k)
+    if (tried.some((t) => t.copies === plan.copies)) continue // 份数一样就是同一种
+    let pick = null
+    for (const cand of plan.loops.length === LOOPS.length - 1
+      ? [plan, arrayPlan(rate, perTower, k, LOOPS.length)]
+      : [plan]) {
+      const res = buildArray(cand, { spray, perTower, title, orient })
+      const o = over(res)
+      if (
+        !pick ||
+        (pick.o.length && !o.length) ||
+        (!pick.o.length === !o.length && res.width * res.height < pick.res.width * pick.res.height)
+      )
+        pick = { res, o }
+    }
+    if (!pick) continue
+    r = pick.res
+    tried.push({
+      loops: r.plan.loops.length,
+      copies: plan.copies,
+      per: plan.per,
+      width: r.width,
+      height: r.height,
+      over: pick.o,
+    })
+    if (!pick.o.length) break
+  }
+  if (!r) throw Error('分馏阵列没有可用的循环')
+  const p = r.plan
+  const first = tried[0],
+    last = tried.at(-1)!
+  const fit = !last.over.length
+  const say = (names: Limit[]) =>
+    [...new Set(names)]
+      .map(
+        (k) =>
+          ({
+            width: `宽度上限 ${maxWidth} 格`,
+            height: `长度上限 ${maxHeight} 格`,
+            aspect: `长宽比上限 ${maxAspect} `,
+          })[k],
+      )
+      .join('、')
+      .replace(/ 、/g, '、')
+  const split = `要 ${p.towers} 座，这张图粘贴 ${p.copies} 份（每份 ${p.per} 座）。`
+  p.limits =
+    maxWidth == null && maxHeight == null && maxAspect == null
+      ? null
+      : {
+          maxWidth,
+          maxHeight,
+          maxAspect,
+          fit,
+          by: [...new Set(tried.flatMap((t) => t.over))],
+          tried,
+        }
+  if (!fit)
+    r.notes.unshift(
+      `${say(last.over)}内放不下一个氢循环（最小 ${last.width}×${last.height}）。${p.copies > 1 ? split : ''}`,
+    )
+  else if (last !== first)
+    r.notes.unshift(
+      `${say(tried.slice(0, -1).flatMap((t) => t.over))}放不下 ${first.loops} 个循环（${first.width}×${first.height}），每份改用 ${p.loops.length} 个循环。${split}`,
+    )
+  else if (p.copies > 1) r.notes.unshift(`一座物流站最多带 ${MAX_TOWERS} 座塔（4 个循环）。${split}`)
+  return r
+}
+
+/** 按 plan 裁一份 */
+function buildArray(
+  plan: ReturnType<typeof arrayPlan> & { limits?: Limits | null },
+  { spray, perTower, title, orient }: BuildOptions,
+) {
+  const bp: Blueprint = fromStr(TEMPLATE)
+  const B = bp.buildings
+  const A = analyzeTemplate(B)
+  if (A.untagged.length) throw new Error(`分馏阵列模板有 ${A.untagged.length} 座建筑没归到循环里`)
+  const keep = new Set(plan.loops.map((l) => l.key))
+  const halves = new Set(LOOPS.filter((l) => keep.has(l.key)).map((l) => l.half))
+  const removed = new Set<number>()
+  for (const b of B) {
+    const t = A.tag.get(b.index)!
+    if (LOOPS.some((l) => l.key === t) && !keep.has(t)) removed.add(b.index)
+    if ((t === 'U' || t === 'L') && !halves.has(t)) removed.add(b.index)
+  }
+  // 不喷增产剂：喷涂机和增产剂带都不要
+  if (!spray)
+    for (const b of B) if (b.itemId === COATER || A.tag.get(b.index) === 'P') removed.add(b.index)
+  // 每个循环留离站最近的塔：氢往外走的那列（8 座）取前一半、往回走的那列（7 座）取后面剩下的，其余换成直带
+  const added = []
+  const replaced = []
+  for (const { key, towers } of plan.loops) {
+    const lp = A.loops.get(key)!
+    const kL = Math.min(8, Math.ceil(towers / 2))
+    const keepT = new Set(
+      [...lp.order.slice(0, kL), ...lp.order.slice(lp.order.length - (towers - kL))].map(
+        (f) => f.index,
+      ),
+    )
+    for (const f of lp.order.filter((f) => !keepT.has(f.index)).reverse()) {
+      const inB = B.find((b) => isBelt(b) && b.outputObjIdx === f.index)
+      const outB = (A.fedBy.get(f.index) ?? []).find((b) => b.inputFromSlot === 2)
+      // 侧面 0 号口出来、并进收集带之前的那几节带子一起删掉
+      let p: Building | null | undefined = (A.fedBy.get(f.index) ?? []).find(
+        (b) => b.inputFromSlot === 0,
+      )
+      while (p && isBelt(p) && (A.preds.get(p.index)?.length ?? 0) <= 1) {
+        removed.add(p.index)
+        p = p.outputObjIdx >= 0 ? B[p.outputObjIdx] : null
+      }
+      removed.add(f.index)
+      if (!inB || !outB) throw Error(`分馏阵列模板的塔 ${f.index} 缺少直通带`)
+      const nb = structuredClone(inB)
+      nb.index = B.length + added.length
+      const c = R(f)
+      const z = inB.localOffset[0].z
+      nb.localOffset = [
+        { x: c.x, y: c.y, z },
+        { x: c.x, y: c.y, z },
+      ]
+      nb.inputObjIdx = -1
+      nb.inputFromSlot = 0
+      nb.outputObjIdx = outB.index
+      nb.outputToSlot = 1
+      added.push(nb)
+      inB.outputObjIdx = nb.index
+      inB.outputToSlot = 1
+      outB.inputObjIdx = -1
+      outB.inputFromSlot = 0
+      for (const b of [inB, outB])
+        for (const o of b.localOffset) {
+          o.x = Math.round(o.x)
+          o.y = Math.round(o.y)
+        }
+      replaced.push(c)
+      A.tag.set(nb.index, key)
+    }
+  }
+  const all = [...B, ...added]
+  // 站：删掉的循环的出站口、删掉的半边的进站口关掉
+  const station = A.station
+  const params = station.parameters
+  if (!params?.slots || !params.storage) throw Error('分馏阵列模板缺少物流站参数')
+  for (const l of LOOPS) if (!keep.has(l.key)) params.slots[l.slot] = { dir: 0, storageIdx: 0 }
+  for (const [half, slot] of Object.entries(SLOT_IN))
+    if (!halves.has(half)) params.slots[slot] = { dir: 0, storageIdx: 0 }
+  // 增产剂：站里那一格换成选的等级，本地、星际都设成需求（2）；不喷就清掉那一格和 5 号口。
+  // 原图这一格是供应（1），运输机、运输船不往供应格里送，喷涂机会一直空着（game-rules 第 42 条）。
+  // 产线出的蓝图喷涂用的增产剂也是需求（emit/blueprint.ts）；上限照原图 8600
+  const proIdx = params.storage.findIndex((x) => x.itemId === PRO)
+  if (proIdx >= 0) {
+    if (spray)
+      params.storage[proIdx] = {
+        ...params.storage[proIdx],
+        itemId: SPRAY[spray].item,
+        localRole: 2,
+        remoteRole: 2,
+      }
+    else {
+      params.storage[proIdx] = { itemId: 0, localRole: 0, remoteRole: 0, max: 0, lockAmount: 0 }
+      params.slots[SLOT_PRO] = { dir: 0, storageIdx: 0 }
+    }
+  }
+  // 增产剂带是一条死路，沿途的喷涂机从它上面取料：最后一台留下的喷涂机之后多留一节，后面的删掉
+  {
+    const pro: Building[] = []
+    let b = spray
+      ? all.find((x) => isBelt(x) && x.inputObjIdx === station.index && x.inputFromSlot === SLOT_PRO)
+      : null
+    while (b && isBelt(b) && !pro.includes(b)) {
+      pro.push(b)
+      b = b.outputObjIdx >= 0 ? all[b.outputObjIdx] : null
+    }
+    let last = -1
+    for (const c of all.filter((x) => x.itemId === COATER && !removed.has(x.index))) {
+      const i = pro.findIndex((q) => Math.abs(R(q).x - R(c).x) + Math.abs(R(q).y - R(c).y) <= 1)
+      last = Math.max(last, i)
+    }
+    if (last >= 0 && last + 1 < pro.length - 1) {
+      for (const q of pro.slice(last + 2)) removed.add(q.index)
+      pro[last + 1].outputObjIdx = -1
+      pro[last + 1].outputToSlot = 0
+    }
+  }
+  // 电塔：留下覆盖得到用电建筑的；再补回连通需要的
+  const reach = powerReach('tesla')
+  const powered = all.filter(
+    (b) => !removed.has(b.index) && [FRAC, PILER, COATER, SPLIT, ST].includes(b.itemId),
+  )
+  const towers = all.filter((b) => b.itemId === TESLA)
+  const d2 = (a: Building, b: Building) => (R(a).x - R(b).x) ** 2 + (R(a).y - R(b).y) ** 2
+  const useful = new Set(
+    towers.filter((t) => powered.some((p) => d2(t, p) <= reach.cover ** 2)).map((t) => t.index),
+  )
+  const connected = (set: Set<number>) => {
+    const list = towers.filter((t) => set.has(t.index))
+    if (!list.length) return true
+    const seen = new Set([list[0].index])
+    const st = [list[0]]
+    while (st.length) {
+      const a = st.pop()!
+      for (const b of list)
+        if (!seen.has(b.index) && d2(a, b) <= reach.link ** 2) {
+          seen.add(b.index)
+          st.push(b)
+        }
+    }
+    return seen.size === list.length
+  }
+  for (let guard = 0; !connected(useful) && guard < towers.length; guard++) {
+    // 补一座离已留电塔最近、能接上的
+    const cand = towers
+      .filter((t) => !useful.has(t.index))
+      .sort(
+        (a, b) =>
+          Math.min(...[...useful].map((i) => d2(a, all[i]))) -
+          Math.min(...[...useful].map((i) => d2(b, all[i]))),
+      )[0]
+    if (!cand) break
+    useful.add(cand.index)
+  }
+  for (const t of towers) if (!useful.has(t.index)) removed.add(t.index)
+  compact(all, removed, A.tag)
+  // 重新编号、修链接
+  const kept = all.filter((b) => !removed.has(b.index))
+  const map = new Map(kept.map((b, i) => [b.index, i]))
+  const tags = new Map<number, string>()
+  for (const b of kept) {
+    const index = map.get(b.index)!
+    tags.set(index, A.tag.get(b.index)!)
+    b.index = index
+    if (b.outputObjIdx >= 0) b.outputObjIdx = map.get(b.outputObjIdx) ?? -1
+    if (b.inputObjIdx >= 0) b.inputObjIdx = map.get(b.inputObjIdx) ?? -1
+  }
+  // 裁边：所有建筑（分馏塔按 3×3、物流站按 7×7）的范围平移到从 0 开始
+  let x0 = Infinity,
+    y0 = Infinity,
+    x1 = -Infinity,
+    y1 = -Infinity
+  for (const b of kept) {
+    const p = R(b)
+    const h = b.itemId === ST ? 3 : b.itemId === FRAC ? 1 : 0
+    x0 = Math.min(x0, p.x - h)
+    y0 = Math.min(y0, p.y - h)
+    x1 = Math.max(x1, p.x + h)
+    y1 = Math.max(y1, p.y + h)
+  }
+  for (const b of kept)
+    for (const o of b.localOffset) {
+      o.x -= x0
+      o.y -= y0
+    }
+  bp.buildings = kept
+  bp.dragBoxSize = { x: x1 - x0 + 1, y: y1 - y0 + 1 }
+  bp.cursorOffset = { x: Math.floor(bp.dragBoxSize.x / 2), y: Math.floor(bp.dragBoxSize.y / 2) }
+  bp.areas = [{ ...bp.areas[0], size: { ...bp.dragBoxSize } }]
+  // 横着出（orient 'h'，只适合赤道附近，见文件头）：比宽还长就整张顺时针转 90°（朝向加 90°，站口、连接不变），站到下边
+  const rotated = orient === 'h' && bp.dragBoxSize.y > bp.dragBoxSize.x
+  if (rotated) rotateBlueprint(bp)
+  const { x: width, y: height } = bp.dragBoxSize
+  const fracs = kept.filter((b) => b.itemId === FRAC).length
+  bp.header = {
+    ...bp.header,
+    icons: [D, FRAC, 0, 0, 0],
+    time: new Date(),
+    shortDesc: title ?? `重氢分馏 ${fracs} 塔`,
+    desc: `${width}×${height} 格；分馏塔 ${fracs} 座，${plan.loops.length} 个氢循环；按每座 ${+perTower.toFixed(1)}/分（集装 4 层，${SPRAY[spray].name}）约 ${Math.round(fracs * perTower)}/分。dsp-handcraft 生成`,
+  }
+  const pct = `${+(SPRAY[spray].p * 100).toFixed(2)}%`
+  const notes = [
+    `每座分馏塔按 ${+perTower.toFixed(1)}/分 估算：极速带集装 4 层的氢流过每座塔约 ${FLOW}/分，${spray ? `喷${SPRAY[spray].name}` : '不喷增产剂'}时分馏概率 ${pct}。`,
+    spray
+      ? `氢从物流站出来先过喷涂机、再过两台自动集装机叠到 4 层；物流站要供氢和${SPRAY[spray].name}（5 号口送去喷涂机），收重氢。`
+      : '氢从物流站出来过两台自动集装机叠到 4 层；物流站要供氢，收重氢。',
+  ]
+  if (replaced.length) notes.push(`有 ${replaced.length} 个塔位换成了直带（氢照样流过）。`)
+  if (rotated)
+    notes.push(
+      '这张横着放（整张转了 90°），只在赤道附近贴得上：离开赤道东西向格子变窄，循环两头最外面的带子先撞分馏塔，再往外塔和塔也撞。',
+    )
+  return {
+    str: toStr(bp),
+    bp,
+    plan,
+    buildings: kept,
+    tags,
+    width,
+    height,
+    fracs,
+    notes,
+    spray,
+    rotated,
+  }
+}
+
+const NAMES: Record<number, string> = {
+  [FRAC]: '分馏塔',
+  [PILER]: '自动集装机',
+  [COATER]: '喷涂机',
+  [SPLIT]: '四向分流器',
+  [ST]: '物流站',
+  [TESLA]: '电力感应塔',
+}
+
+/**
+ * 分馏阵列的独立检查：索引和链接、带子不重格、每座分馏塔前后都接着带子、
+ * 每条重氢都能流回站、每座用电建筑都在电塔覆盖范围内、电塔连成一张网，
+ * 贴蓝图会不会撞（compact.ts 的 collisions：建造盒、带子的球和胶囊、电塔中心距 3.5 m，照游戏贴图的判法取严的一边）：
+ * 赤道上撞、贴到这张图的行数能到的最窄纬度才撞（东西向格宽 narrowestEW，第 41 条）都算错——阵列要在哪个纬度都能贴。
+ * stats.collisions：{ equator 赤道上撞几对, narrow 最窄纬度多撞几对, ew 最窄的东西向格宽 }
+ */
+export function checkArray(str: string) {
+  const bp: Blueprint = fromStr(str.trim())
+  const B = bp.buildings
+  const errors: string[] = []
+  const warnings = []
+  const err = (m: string) => errors.length < 100 && errors.push(m)
+  B.forEach((b, i) => {
+    if (b.index !== i) err(`建筑 ${i} 的 index 为 ${b.index}`)
+    for (const k of ['outputObjIdx', 'inputObjIdx'] as const)
+      if (b[k] < -1 || b[k] >= B.length) err(`建筑 ${i} 的 ${k}=${b[k]} 越界`)
+  })
+  const W = bp.dragBoxSize.x,
+    Hh = bp.dragBoxSize.y
+  for (const b of B) {
+    const p = R(b)
+    if (p.x < 0 || p.y < 0 || p.x >= W || p.y >= Hh)
+      err(`建筑 ${b.index} 在 (${p.x},${p.y})，超出 ${W}×${Hh} 的范围`)
+  }
+  // 带子：同一位置同一高度只能有一节（集装机、分流器前后的两节挤在同一格里，按精确坐标判断）
+  const seen = new Map<string, number>()
+  for (const b of B.filter(isBelt)) {
+    const o = b.localOffset[0]
+    const k = `${o.x.toFixed(2)},${o.y.toFixed(2)},${o.z.toFixed(2)}` // 原图的高架有 0.5、1 两种高度，同一格上下叠两条
+    if (seen.has(k)) err(`传送带 ${seen.get(k)} 和 ${b.index} 重叠于 ${k}`)
+    seen.set(k, b.index)
+    if (b.outputObjIdx >= 0) {
+      const n = B[b.outputObjIdx]
+      const q = n.localOffset[0]
+      const dist = Math.hypot(q.x - o.x, q.y - o.y)
+      if (isBelt(n) && dist > 1.5 && Math.abs(q.z - o.z) < 0.5)
+        err(`传送带 ${b.index}→${n.index} 不相邻（${dist.toFixed(2)} 格）`)
+    }
+  }
+  const fedBy = new Map<number, Building[]>()
+  for (const b of B) if (isBelt(b) && b.inputObjIdx >= 0) addBelt(fedBy, b.inputObjIdx, b)
+  const station = B.find((b) => b.itemId === ST)
+  if (!station) err('没有物流站')
+  for (const f of B.filter((b) => b.itemId === FRAC)) {
+    const ins = B.filter((b) => isBelt(b) && b.outputObjIdx === f.index)
+    const outs = fedBy.get(f.index) ?? []
+    if (ins.length !== 1) err(`分馏塔 ${f.index} 有 ${ins.length} 条进料带`)
+    if (!outs.some((b) => b.inputFromSlot === 2))
+      err(`分馏塔 ${f.index} 的直通口（2 号）没接带子，氢会堵住`)
+    // 重氢顺着带子能流回物流站
+    const b = outs.find((x) => x.inputFromSlot === 0)
+    if (!b) {
+      err(`分馏塔 ${f.index} 的产物口（0 号）没接带子`)
+      continue
+    }
+    const visited = new Set<number>()
+    let ok = false
+    const st = [b]
+    while (st.length) {
+      const c = st.pop()!
+      if (visited.has(c.index)) continue
+      visited.add(c.index)
+      if (c.itemId === ST) {
+        ok = true
+        break
+      }
+      if (c.itemId === FRAC) continue // 重氢不该再进分馏塔
+      if (isBelt(c)) {
+        if (c.outputObjIdx >= 0) st.push(B[c.outputObjIdx])
+      } else st.push(...(fedBy.get(c.index) ?? []))
+    }
+    if (!ok) err(`分馏塔 ${f.index} 出来的重氢流不回物流站`)
+  }
+  // 供电
+  const reach = powerReach('tesla')
+  const towers = B.filter((b) => b.itemId === TESLA)
+  const need = B.filter((b) => [FRAC, PILER, COATER, SPLIT, ST].includes(b.itemId))
+  const d2 = (a: Building, b: Building) => (R(a).x - R(b).x) ** 2 + (R(a).y - R(b).y) ** 2
+  for (const b of need)
+    if (!towers.some((t) => d2(t, b) <= reach.cover ** 2))
+      err(`建筑 ${b.index}（${NAMES[b.itemId]}）不在供电范围内`)
+  if (towers.length) {
+    const seenT = new Set([towers[0].index])
+    const st = [towers[0]]
+    while (st.length) {
+      const a = st.pop()!
+      for (const t of towers)
+        if (!seenT.has(t.index) && d2(a, t) <= reach.link ** 2) {
+          seenT.add(t.index)
+          st.push(t)
+        }
+    }
+    if (seenT.size < towers.length) warnings.push('电力感应塔没有连成一张网')
+  }
+  // 碰撞：赤道上（东西向格宽 1）一遍，这张图能贴到的最窄纬度一遍
+  const ew = narrowestEW(Hh)
+  const what = (b: Building) => {
+    const o = b.localOffset[0]
+    return `${isBelt(b) ? '传送带' : (NAMES[b.itemId] ?? b.itemId)} ${b.index}（${+o.x.toFixed(2)},${+o.y.toFixed(2)}${isBelt(b) && o.z > 0.25 ? `，高 ${+o.z.toFixed(2)} 层` : ''}）`
+  }
+  const pair = ([i, j]: [number, number]) =>
+    B[i].itemId === TESLA && B[j].itemId === TESLA
+      ? `${what(B[i])}和${what(B[j])}中心不到 3.5 m`
+      : `${what(B[i])}和${what(B[j])}相撞`
+  const atEquator = collisions(B, 1)
+  const seenPair = new Set(atEquator.map(([i, j]) => `${i},${j}`))
+  const offEquator = collisions(B, ew).filter(([i, j]) => !seenPair.has(`${i},${j}`))
+  for (const p of atEquator) err(`${pair(p)}（赤道上就撞）`)
+  for (const p of offEquator)
+    err(`${pair(p)}（贴到离赤道远的地方会撞：东西向格子最窄到赤道的 ${(ew * 100).toFixed(1)}%）`)
+  return {
+    ok: !errors.length,
+    errors,
+    warnings,
+    stats: {
+      width: W,
+      height: Hh,
+      buildings: B.length,
+      fractionators: B.filter((b) => b.itemId === FRAC).length,
+      belts: B.filter(isBelt).length,
+      power: towers.length,
+      collisions: { equator: atEquator.length, narrow: offEquator.length, ew },
+    },
+  }
+}
+
+/**
+ * 碰撞扫一遍（compact.ts 的 collisions，同 checkArray）：照出出来的蓝图本身（转过 90° 的就是转完的，x 东西向），
+ * ew 东西向格宽是赤道的几分之几，默认这张图的行数能贴到的最窄纬度（narrowestEW）。返回撞的对子 [index, index]
+ */
+export function arrayCollisions(
+  result: Pick<ModelInput, 'buildings' | 'height'>,
+  ew = narrowestEW(result.height),
+) {
+  return collisions(result.buildings, ew)
+}
+
+/**
+ * 网页画图用的模型：分馏塔、物流站、集装机等小设备、电塔，带子按物品分成一段段逐格路径。
+ * 转过 90° 的图（result.rotated）：模型照转之前的坐标、朝向给，标 rotated，网页整组顺时针转 90° 显示（同普通产线的竖排；分馏塔只画得出朝左、朝右）
+ */
+export function arrayModel(result: ModelInput) {
+  const B = result.buildings
+  const tags = result.tags
+  const turned = !!result.rotated
+  // (x, y) → (y, W − 1 − x) 倒回去：W 是转之前的宽，也就是转之后的长
+  const pos = (b: Building): Point3 =>
+    turned
+      ? { x: result.height - 1 - b.localOffset[0].y, y: b.localOffset[0].x, z: b.localOffset[0].z }
+      : b.localOffset[0]
+  const P = (b: Building): Point2 => ({ x: Math.round(pos(b).x), y: Math.round(pos(b).y) })
+  const yaw = (b: Building) => (turned ? (((b.yaw[0] - 90) % 360) + 360) % 360 : b.yaw[0])
+  const proId = SPRAY[result.spray ?? 3].item || PRO
+  const itemOf = (b: Building) => (tags.get(b.index) === 'P' ? proId : null)
+  // 带子的物品：顺着链子看，接到物流站重氢进站口 / 从分馏塔 0 号口出来的是重氢，增产剂单独，其余是氢
+  const item = new Map<number | string, number>()
+  const fedBy = new Map<number, Building[]>()
+  for (const b of B) if (isBelt(b) && b.inputObjIdx >= 0) addBelt(fedBy, b.inputObjIdx, b)
+  const paint = (starts: Building[], id: number) => {
+    const st = [...starts]
+    while (st.length) {
+      const b = st.pop()!
+      if (!isBelt(b) || item.has(b.index)) {
+        if (b && (b.itemId === PILER || b.itemId === SPLIT) && !item.has(`d${b.index}`)) {
+          item.set(`d${b.index}`, id)
+          st.push(...(fedBy.get(b.index) ?? []))
+        }
+        continue
+      }
+      item.set(b.index, id)
+      if (b.outputObjIdx >= 0) st.push(B[b.outputObjIdx])
+    }
+  }
+  for (const f of B.filter((b) => b.itemId === FRAC))
+    paint(
+      (fedBy.get(f.index) ?? []).filter((b) => b.inputFromSlot === 0),
+      D,
+    )
+  for (const b of B) if (isBelt(b) && itemOf(b)) item.set(b.index, proId)
+  for (const b of B) if (isBelt(b) && !item.has(b.index)) item.set(b.index, H)
+  // 逐格路径：从没有前一节带子（或前一节是设备、或是汇流点）的地方起，走到设备或汇流点为止
+  const preds = new Map<number, number>()
+  for (const b of B)
+    if (isBelt(b) && b.outputObjIdx >= 0 && isBelt(B[b.outputObjIdx]))
+      preds.set(b.outputObjIdx, (preds.get(b.outputObjIdx) ?? 0) + 1)
+  // 楼层：原图的高架有 0.5 和 1 两种高度（同一格上下叠两条），画图时分到 L2、L3
+  const cellOf = (b: Building): [number, number, number] => [
+    P(b).x,
+    P(b).y,
+    Math.max(0, Math.round(b.localOffset[0].z * 2)),
+  ]
+  const routes = []
+  const used = new Set<number>()
+  for (const h of B.filter((b) => isBelt(b) && (preds.get(b.index) ?? 0) !== 1)) {
+    const cells: [number, number, number][] = []
+    let c: Building | null = h
+    while (c && isBelt(c) && !used.has(c.index)) {
+      used.add(c.index)
+      const p = cellOf(c)
+      const previous = cells.at(-1)
+      if (!previous || previous[0] !== p[0] || previous[1] !== p[1] || previous[2] !== p[2])
+        cells.push(p)
+      const n: Building | null = c.outputObjIdx >= 0 ? B[c.outputObjIdx] : null
+      if (n && isBelt(n) && (preds.get(n.index) ?? 0) > 1) {
+        cells.push(cellOf(n)) // 画到汇流点那一格，线才接得上
+        break
+      }
+      c = n
+    }
+    if (cells.length)
+      routes.push({ itemId: item.get(h.index)!, cells, inPort: false, outPort: false })
+  }
+  const loopLetter = (b: Building) => tags.get(b.index) ?? ''
+  const fr = B.filter((b) => b.itemId === FRAC)
+  const byY = new Map<number, Building[]>()
+  for (const f of fr) {
+    const p = P(f)
+    addBelt(byY, p.y, f)
+  }
+  const rows = [...byY.entries()].map(([cy, fs]) => ({
+    cy,
+    groups: fs.map((f) => ({
+      id: `f${f.index}`,
+      letter: loopLetter(f),
+      item: '重氢',
+      factory: '分馏塔',
+      kind: 'fractionator',
+      count: 1,
+      centers: [P(f).x],
+      below: 1,
+      above: 1,
+      yaw: yaw(f),
+    })),
+  }))
+  const devices = B.filter((b) => [PILER, COATER, SPLIT].includes(b.itemId)).map((b) => ({
+    x: P(b).x,
+    y: P(b).y,
+    kind: b.itemId === PILER ? 'piler' : b.itemId === COATER ? 'coater' : 'splitter',
+    yaw: yaw(b),
+  }))
+  const reach = powerReach('tesla')
+  const st = B.find((b) => b.itemId === ST)
+  const n = result.fracs * result.plan.perTower
+  return {
+    width: turned ? result.height : result.width,
+    height: turned ? result.width : result.height,
+    rotated: turned,
+    origin: { x: 0, y: 0 },
+    rows,
+    items: {
+      [H]: { name: '氢', letter: 'h', rate: n },
+      [D]: { name: '重氢', letter: 'd', rate: n },
+      ...(result.spray ? { [proId]: { name: SPRAY[result.spray].name, letter: 'p', rate: 0 } } : {}),
+    },
+    segments: [],
+    legs: [],
+    sorters: [],
+    power: {
+      name: POWER.tesla.name,
+      size: 1,
+      cover: reach.cover,
+      nodes: B.filter((b) => b.itemId === TESLA).map((b) => P(b)),
+    },
+    stations: st ? [P(st)] : [],
+    stubs: [],
+    routes,
+    devices,
+    streets: [],
+    trunk: null,
+  }
+}

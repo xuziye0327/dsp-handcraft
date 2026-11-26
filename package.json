@@ -1,17 +1,21 @@
 {
   "name": "dsp-handcraft-rev",
   "private": true,
+  "license": "GPL-3.0-only",
   "type": "module",
-  "module": "index.ts",
+  "module": "src/index.ts",
   "scripts": {
     "fmt": "oxfmt",
     "fmt:check": "oxfmt --check",
     "check": "oxlint --type-aware --type-check",
     "check:fix": "oxlint --type-aware --type-check --fix",
     "prepare": "husky",
-    "typecheck": "bun --check"
+    "typecheck": "tsc --noEmit",
+    "build": "bun web/build.ts",
+    "dev": "bun web/dev.ts"
   },
   "dependencies": {
+    "pako": "^2.1.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },
@@ -19,6 +23,7 @@
     "@types/bun": "latest",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "esbuild": "^0.28.2",
     "husky": "^9.1.7",
     "lint-staged": "^17.6.0",
     "oxfmt": "^0.78.0",

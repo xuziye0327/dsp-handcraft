@@ -1,0 +1,23 @@
+:root {
+  color-scheme: dark;
+  --bg: #121212;
+  --surface: #1c1c1f;
+  --line: rgb(255 255 255 / 0.07);
+  --line-2: rgb(255 255 255 / 0.13);
+  --line-3: rgb(255 255 255 / 0.26);
+  --text: #ededef;
+  --text-2: #a6a6ad;
+  --text-3: #85858c;
+  --accent: #f0913a;
+  --accent-ink: #f5a052;
+  --on-accent: #141415;
+  --band: #191919;
+  --band-2: #202024;
+  --rule: rgb(255 255 255 / 0.13);
+  --ink: #ededef;
+  --ink-2: #a6a6ad;
+  --grid: rgb(255 255 255 / 0.03);
+  --cta: #f0913a;
+  --cta-ink: #141415;
+  --cta-hover: #f5a052;
+}

@@ -1,0 +1,1066 @@
+// 增产剂与自动集装机：照分馏阵列（src/fractionate/template.js，game-rules 第 14 条）学来的摆法，作为后处理加到普通产线上。
+//   自动集装机：放在一节直带上，那一格拆成两节带子（进的一节往来路偏 0.2 格接 1 号口，出的一节往去路偏 0.2 格从 0 号口出），朝向 = 流向；
+//     用在产物出线（进物流站或出边缘）之前，把产物叠成几层再送走（怎么叠见 game-rules 第 36 条）。
+//   喷涂机：骑在一节直带上（见 coaterFits），朝向沿着带子；它背后那一格正上方一层要有一条增产剂带横穿过去，喷涂机从那里取增产剂。
+//     增产剂带是一条死路：从物流站的一个空口（或边缘的一个入口）出来，按顺序横穿若干台喷涂机背后那格，最后一台之后再多走一节；
+//     喷涂机多时开几条（L.proLines），尽量都从同一座站出来（整张存增产剂只占一个物流站格，keepFreeSlot 留的那格）。
+//   喷什么：最终产物的直接原料（sprayItems），喷涂机放在最终那几组（sprayTo）的第一个取料口之前、最后一个放料口和别的消费者最后一个取料口之后
+//     （上游的工厂吃到的是没喷的：只喷一部分原料不起作用，增产剂白耗）；走线已经保证不交错并留出直带空当（layout/belts.js 的 sprayHere / SPRAY_GAP）。
+import { chainTiles } from '../emit/blueprint.js'
+import { SPRAY_LEVELS, ITEMS, realItem, baseItem } from '../gamedata.js'
+import { translateLayout } from './coordinates.js'
+import type { Layout, Tile, Cell, Leg, Port } from './domain.js'
+import { sprayGapCells } from './layout/elevation.js'
+import { portRays } from './layout/shared.js'
+import { STACK_AT, pileOnce, slotsOf, takeItems } from './piling.js'
+import { obstacles, obstacleGrid, pathfind, dirIndex, STATION_PORTS } from './stations.js'
+import { storeSites } from './storage.js'
+
+interface AddonOptions {
+  spray?: number
+  sprayItems?: number[] | null
+  sprayTo?: (string | number)[] | null
+  pile?: boolean
+  sprayRate?: number
+  supply?: string | null
+  sorter?: number
+  maxLayers?: number
+  stackCap?: number
+  sorterStack?: number
+}
+type Coater = {
+  x: number
+  y: number
+  z: number
+  ix: number
+  iy: number
+  perps: number[][]
+  halfPerps: number[][]
+  pre?: { leg: Leg; port: Port; cells: Tile[] }
+}
+type Want = { options: Coater[]; chain: number; itemId: number; rate: number }
+type Cover = { wants: Set<Want>; at: number; vertical: boolean; cells: number[] }
+type Site = ReturnType<typeof storeSites>[number]
+type Source = {
+  start: Tile
+  dir: number
+  lead: Tile[]
+  station: { k: number; slot: number } | null
+  needsItem: boolean
+  d: number
+  site?: Site
+}
+type Tiles = { main: Tile[]; extra: Tile[][] }
+
+const key = (x: number, y: number) => `${x},${y}`
+const cell = (x: number, y: number, z: number) => `${x},${y},${z}`
+/** 喷涂机朝向 → 取增产剂那一格相对它的偏移（背后）：朝北（0）取南边那格，朝东（90）取西边，以此类推 */
+export const COATER_BEHIND: Record<string, [number, number]> = {
+  0: [0, -1],
+  90: [-1, 0],
+  180: [0, 1],
+  270: [1, 0],
+}
+export const coaterYaw = (dx: number, dy: number) =>
+  Number(
+    Object.keys(COATER_BEHIND).find((k) => COATER_BEHIND[k][0] === dx && COATER_BEHIND[k][1] === dy),
+  )
+
+/** 第 k 格和前后两格在一条直线上、同一层（地面或高架：实测喷涂机能骑在高架带上） */
+const straight = (t: Tile[], k: number) => {
+  const a = t[k - 1],
+    b = t[k],
+    c = t[k + 1]
+  if (!a || !b || !c || a[2] !== b[2] || c[2] !== b[2]) return false
+  const dx = b[0] - a[0],
+    dy = b[1] - a[1]
+  return Math.abs(dx) + Math.abs(dy) === 1 && c[0] - b[0] === dx && c[1] - b[1] === dy
+}
+/**
+ * 喷涂机能不能骑在第 k 格（实测，game-rules 第 24 条）：它压着的 3 格（k−1、k、k+1）不能转弯、不能升降，
+ * 所以这 3 格在同一层的一条直线上，而且再往外各一格（k−2、k+2）也在这一层、顺着同一方向进出——转弯、坡道、竖直升降最近只能在 k±2 那格。
+ * 带子从 k−1 开头（边缘入口，没有来路）可以；从物流站出来的带子 k−1 是第一格时，站口的朝向说不准，不放。
+ */
+const coaterFits = (t: Tile[], k: number, openStart = false) => {
+  if (!straight(t, k)) return false
+  const dx = t[k][0] - t[k - 1][0],
+    dy = t[k][1] - t[k - 1][1]
+  const z = t[k][2]
+  const a = t[k - 2],
+    c = t[k + 2]
+  if (a ? a[2] !== z || t[k - 1][0] - a[0] !== dx || t[k - 1][1] - a[1] !== dy : !openStart)
+    return false
+  return !c || (c[2] === z && c[0] - t[k + 1][0] === dx && c[1] - t[k + 1][1] === dy)
+}
+
+/** 喷涂机取料格所在的线：横带上是取料格那一列（增产剂带竖着穿），竖带上是那一行 */
+const lineOf = (o: Coater) => (o.y === o.iy ? `x${o.ix}` : `y${o.iy}`)
+/**
+ * 喷涂机对齐：每条要喷的带上能骑喷涂机的位置一般有好几个，挑尽量少的几列（行），让各台喷涂机的取料格对成一条线（增产剂带一路直穿过去）。
+ * 贪心集合覆盖：每次挑能覆盖最多条带的那一列；一样多时先挑这几台之间整段第 1 层都空着（blocked 判挡不挡）的，再挑离已经选中的列近的。
+ * 每条带的候选按「在选中的列上」排前面、其余按离选中的列多远排，最多留 6 个给找路（找路按顺序试）
+ */
+function alignCoaters(wants: Want[], blocked: (x: number, y: number) => boolean) {
+  const left = new Set(wants)
+  const chosen: { key: string; at: number; vertical: boolean }[] = [] // [{ key, at: 列或行的坐标, vertical }]
+  while (left.size) {
+    const cover = new Map<string, Cover>() // key → { wants: Set, at, vertical, cells: [取料格的另一坐标] }
+    for (const w of left)
+      for (const o of w.options) {
+        const k = lineOf(o)
+        if (!cover.has(k))
+          cover.set(k, {
+            wants: new Set(),
+            at: o.y === o.iy ? o.ix : o.iy,
+            vertical: o.y === o.iy,
+            cells: [],
+          })
+        const c = cover.get(k)
+        if (!c!.wants.has(w)) c!.cells.push(c!.vertical ? o.iy : o.ix)
+        c!.wants.add(w)
+      }
+    if (!cover.size) break
+    const straightOk = (c: Cover) => {
+      if (c.wants.size < 2) return false
+      const lo = Math.min(...c.cells),
+        hi = Math.max(...c.cells)
+      for (let v = lo + 1; v < hi; v++)
+        if (!c.cells.includes(v) && (c.vertical ? blocked(c.at, v) : blocked(v, c.at))) return false
+      return true
+    }
+    const near = (c: Cover) =>
+      chosen.length
+        ? Math.min(
+            ...chosen.filter((q) => q.vertical === c.vertical).map((q) => Math.abs(q.at - c.at)),
+            99,
+          )
+        : 0
+    let best = null
+    for (const [k, c] of cover) {
+      const score = [c.wants.size, straightOk(c) ? 1 : 0, -near(c)]
+      if (
+        !best ||
+        score[0] > best.score[0] ||
+        (score[0] === best.score[0] &&
+          (score[1] > best.score[1] || (score[1] === best.score[1] && score[2] > best.score[2])))
+      )
+        best = { k, c, score }
+    }
+    chosen.push({ key: best!.k, at: best!.c.at, vertical: best!.c.vertical })
+    for (const w of best!.c.wants) left.delete(w)
+  }
+  const rank = new Map(chosen.map((q, i) => [q.key, i]))
+  const dist = (o: Coater) =>
+    Math.min(
+      99,
+      ...chosen
+        .filter((q) => q.vertical === (o.y === o.iy))
+        .map((q) => Math.abs(q.at - (o.y === o.iy ? o.ix : o.iy))),
+    )
+  for (const w of wants) {
+    w.options.sort(
+      (a, b) => (rank.get(lineOf(a)) ?? 1e9) - (rank.get(lineOf(b)) ?? 1e9) || dist(a) - dist(b),
+    )
+    w.options = w.options.slice(0, 6)
+  }
+}
+
+/** 产物带（原料带头一截是入口的高架段）里运的超过单条带运力 cap 的：开集装机时 layout/belts.js 按 pileCap 排成一条（route 选项 pileModel，不写是 4 倍） */
+const stackChain = (L: Layout, ch: Layout['chains'][number], cap: number) => {
+  const q0 = ch.parts[0]
+  if (q0?.leg != null && L.legs[q0.leg].kind === 'in') return false // 原料：站口出来的是叠好的（rawCap），不在这里集装
+  let rate = 0
+  for (const q of ch.parts) if (q.seg != null) rate = Math.max(rate, L.segments[q.seg].rate)
+  return rate > cap + 1e-6
+}
+/**
+ * 布局里有没有要集装的带（stackCap：单条带运力，route.js 的 stackCapOf；0 是关着）。sorterStack：集装分拣器往带上叠几层
+ * （route.js 的 sorterStackOf），放上带的货物本来就叠这么多层，一条带不靠集装机运 stackCap × sorterStack，超了才要集装
+ */
+export const needsStacking = (L: Layout, stackCap: number, sorterStack = 1) =>
+  stackCap > 0 && L.chains.some((ch) => stackChain(L, ch, stackCap * sorterStack))
+
+/**
+ * 集装：产物带一条运的超过单条带的运力时（layout/belts.js 的 pileCap），分拣器放上带的是单个物品，一个占一个格位。沿流向数每分钟占了多少格位，
+ * 过了 STACK_AT 就在下游第一格能放的直带上（can）放一台自动集装机，过一台按 plan/piling.js 的 pileOnce 算（一台只把相邻两个货物合成一个，
+ * game-rules 第 36 条）。取料只减物品（保守，takeItems）；放料按每台工厂满速（取放事件和 layout/belts.js 一样），同一台工厂在这一段同一个方向
+ * 有几根分拣器时平分。哪儿的格位超过单条带的运力（集装机放不下），记进 L.stackShort（finishOne 判不可行）。cap：单条带的格位（每分钟，极速带 1800）。
+ * layers：集装分拣器往带上叠几层（route.js 的 sorterStack）：放料 e 个按 e ÷ layers 个 layers 层的货物记（游戏里还会补到 layers 层，这里不算，保守），
+ * 一条带不靠集装机运 cap × layers，超过的链才集装
+ */
+function stackPilers(
+  L: Layout,
+  tiles: Tiles[],
+  cap: number,
+  layers: number,
+  can: (x: number, y: number) => boolean,
+  used: Set<string>,
+  name: (id: number) => string,
+) {
+  const segChain = new Map<number, number>()
+  L.chains.forEach((ch, ci) => {
+    if (stackChain(L, ch, cap * layers))
+      for (const q of ch.parts) if (q.seg != null) segChain.set(q.seg, ci)
+  })
+  const nSame = new Map<string, number>()
+  const sk = (s: Layout['sorterList'][number]) => `${s.segId}|${s.bid}|${s.building}|${s.io}`
+  for (const s of L.sorterList) nSame.set(sk(s), (nSame.get(sk(s)) ?? 0) + 1)
+  const evOf = new Map<number, Map<string, number[]>>() // 要集装的链 → 格 → [放 +、取 −]
+  for (const s of L.sorterList) {
+    const ci = segChain.get(s.segId!)
+    if (ci == null) continue
+    const seg = L.segments[s.segId!]
+    const tap = seg.taps.find((t) => t.bid === s.bid && t.io === s.io)
+    if (!tap) continue
+    if (!evOf.has(ci)) evOf.set(ci, new Map())
+    const m = evOf.get(ci)
+    const k = key(s.col, seg.y)
+    if (!m!.has(k)) m!.set(k, [])
+    m!.get(k)!.push(((s.io === 'out' ? 1 : -1) * tap.rate) / nSame.get(sk(s))!)
+  }
+  const T = cap * STACK_AT
+  const short: string[] = []
+  const count = new Map<number, number>() // 物品 → 台数
+  tiles.forEach((t, ci) => {
+    const ev = evOf.get(ci)
+    if (!ev) return
+    const itemId = L.chains[ci].itemId
+    let peak = 0
+    // 主链和劈开的死胡同那一半各走一遍（死胡同从劈开处起，料不进主链）
+    for (const m of [t.main, ...t.extra]) {
+      let c = [0, 0, 0, 0, 0] // 带上每分钟 1~4 层的货物各几个（plan/piling.js）
+      let fresh = Infinity // 上一台集装机之后新放上来的单个物品（带头起算不限）
+      let want = false
+      let back = -1 // 上一台集装机之后最近一格能放（没放）的，和到那儿时带上的货物
+      let backC = null
+      let backFresh = 0
+      const put = (k: number, next: number[]) => {
+        const [x, y] = m[k]
+        L.pilers!.push({ chain: ci, x, y, dx: m[k + 1][0] - x, dy: m[k + 1][1] - y, itemId })
+        // 集装机沿流向前后各伸进邻格大半格：邻格也不再放别的喷涂机、集装机
+        for (const j of [k - 1, k, k + 1]) used.add(key(m[j][0], m[j][1]))
+        count.set(itemId, (count.get(itemId) ?? 0) + 1)
+        want = false
+        back = -1
+        c = next
+        fresh = 0
+      }
+      for (let k = 0; k < m.length; k++) {
+        const [x, y, z] = m[k]
+        if (k >= 1 && k < m.length - 1 && straight(m, k) && can(x, y)) {
+          const next = want ? pileOnce(c, cap, fresh) : null
+          // 格位降不到运力的 1%（上一台之后没放几个新的）：这台没用，不放，等下游放了新的再说
+          if (next && slotsOf(c) - slotsOf(next) > cap / 100) put(k, next)
+          else {
+            back = k
+            backC = c.slice()
+            backFresh = fresh
+          }
+        }
+        const es = z === 0 ? ev.get(key(x, y)) : undefined
+        if (es) {
+          // 放料 e 个是 e ÷ layers 个 layers 层的货物
+          for (const e of es)
+            if (e > 0) {
+              c[layers] += e / layers
+              fresh += e / layers
+            }
+          for (const e of es) if (e < 0) takeItems(c, -e)
+        }
+        const slots = slotsOf(c)
+        // 超了运力还没等到能放的格（分拣器一格挨一格）：退回上一台之后最近一格能放的，放在那儿、从那儿重走（那儿放了也没用就不退）
+        if (slots > cap + 1e-6 && back >= 0) {
+          const next = pileOnce(backC!, cap, backFresh)
+          if (slotsOf(backC!) - slotsOf(next) > cap / 100) {
+            k = back
+            put(k, next)
+            continue
+          }
+          back = -1
+        }
+        if (slots > peak) peak = slots
+        if (slots > T + 1e-6) want = true
+      }
+    }
+    if (peak > cap + 1e-6) short.push(`${name(itemId)}（有一段单个物品 ${Math.round(peak)}/分）`)
+  })
+  for (const [id, n] of count)
+    L.addonNotes!.push(`${name(id)}带上放了 ${n} 台自动集装机（带运力不够一条带时集装）`)
+  if (short.length) {
+    L.stackShort = `${short.join('、')}带上放不下够用的自动集装机，超过一条带的运力 ${cap}/分`
+    L.addonNotes!.push(L.stackShort)
+  }
+}
+
+/**
+ * 在布局上加自动集装机（pile：产物出线前；stackCap：运的超过一条带的产物带上集装，sorterStack 集装分拣器往带上叠几层，见 stackPilers）
+ * 和喷涂机 + 增产剂带（spray 1~3）。改写 L：
+ *   L.pilers   [{chain, x, y, dx, dy, itemId}]   集装机所在格和流向
+ *   L.coaters  [{chain, x, y, ix, iy, itemId}]   喷涂机所在格、取料格
+ *   L.proLines [{cells, station: {k, slot} | null, edge, itemId, rate}]  增产剂带（逐格，从源头起），可能有几条
+ *   L.addonNotes 放不下的说明；L.sprayMissed 没喷上的带数（应为 0，finishOne 据此判不可行）；L.stackShort 集装机放不下时的说明（有才写，finishOne 据此判不可行）
+ */
+export function addAddons(
+  L: Layout,
+  {
+    spray = 0,
+    sprayItems = null,
+    sprayTo = null,
+    pile = false,
+    sprayRate: _sprayRate = 0,
+    supply = null,
+    sorter = 2013,
+    maxLayers = 15,
+    stackCap = 0,
+    sorterStack = 1,
+  }: AddonOptions = {},
+) {
+  L.pilers = []
+  L.coaters = []
+  L.proLines = []
+  L.addonNotes = []
+  L.sprayMissed = 0
+  if (!spray && !pile && !stackCap) return L
+  const eff = SPRAY_LEVELS[spray] ?? null
+  if (eff) {
+    // 四周各留两格给增产剂带绕路、给边缘入口往外接（最后裁掉没用到的）。
+    // 不接站的布局里，原料入口的直带空当可能伸到负坐标（layout/belts.js 的 SPRAY_GAP），一并挪回正数
+    let mnx = 0,
+      mny = 0
+    for (const ch of L.chains) {
+      const t = chainTiles(L, ch)
+      for (const [x, y] of [...t.main, ...t.extra.flat()]) {
+        if (x < mnx) mnx = x
+        if (y < mny) mny = y
+      }
+    }
+    // 不接站时原料入口的喷涂机骑在入口往外接出的两三节上（layout/belts.js 的 edgeIn；入口原地升起时要三节），左右各留三格
+    const mx = L.stations?.length ? 2 : 3
+    translateLayout(L, mx - mnx, 2 - mny)
+    L.width += 2 * mx - mnx
+    L.height += 4 - mny
+  }
+  const tiles = L.chains.map((ch) => chainTiles(L, ch))
+  const sorterCells = new Set(L.sorterList.map((s) => key(s.col, L.segments[s.segId!].y)))
+  for (const g of L.labGaps || []) for (const t of g.taps) sorterCells.add(key(g.x, t.y)) // 研究站夹带上侧面分拣器接的格
+  const overhead = new Set<string>() // 头顶有高架的格子（任何层）：集装机不放
+  const levelsAt = new Map<string, number[]>() // 每格有带子的层（> 0）：喷涂机两层高，骑在第 z 层时 z+1、z+2 层不能有别的带（走线的保护区也只占这两层）
+  for (const t of tiles)
+    for (const [x, y, z] of [...t.main, ...t.extra.flat()])
+      if (z > 0) {
+        overhead.add(key(x, y))
+        const k = key(x, y)
+        if (!levelsAt.has(k)) levelsAt.set(k, [])
+        levelsAt.get(k)!.push(z)
+      }
+  const headBlocked = (x: number, y: number, z: number) =>
+    (levelsAt.get(key(x, y)) ?? []).some((v) => v > z && v <= z + 2)
+  const nearStation = (x: number, y: number) =>
+    (L.stations || []).some((st) => Math.abs(st.x - x) <= 3 && Math.abs(st.y - y) <= 3)
+  const used = new Set<string>()
+  // 喷涂机的空当（layout/belts.js 留的直带）：集装机不去占
+  const gapGuard = new Set<string>()
+  if (eff)
+    for (const s of L.segments)
+      if (s.sprayGap) for (const x of sprayGapCells(s)) gapGuard.add(key(x, s.y))
+  const PRO_MAX_Z = 6 // 增产剂带最高走到第 6 层（和接站的线一样），喷涂机最高骑在第 5 层
+  const MAX_COATER_Z = PRO_MAX_Z - 1
+  const free = (x: number, y: number) =>
+    !sorterCells.has(key(x, y)) &&
+    !overhead.has(key(x, y)) &&
+    !nearStation(x, y) &&
+    !used.has(key(x, y)) &&
+    !gapGuard.has(key(x, y))
+  const name = (id: number) => ITEMS.get(realItem(id))?.name ?? String(id)
+
+  // 运的超过一条带的产物带上集装（先放：出线前的集装机、喷涂机都让开这几格）。分拣器横穿的格也不放（和喷涂机一样保守）
+  if (needsStacking(L, stackCap, sorterStack)) {
+    const span = new Set<string>()
+    for (const s of L.sorterList) {
+      const p = L.pos.get(s.bid)
+      const y0 = L.rowCy[p!.row] + (s.side === 'top' ? p!.g.edgeAbove : -p!.g.edgeBelow)
+      const y1 = L.segments[s.segId!].y
+      for (let y = Math.min(y0, y1); y <= Math.max(y0, y1); y++) span.add(key(s.col, y))
+    }
+    stackPilers(
+      L,
+      tiles,
+      stackCap,
+      sorterStack,
+      (x, y) => free(x, y) && !span.has(key(x, y)),
+      used,
+      name,
+    )
+  }
+
+  if (pile) {
+    const missed: string[] = []
+    tiles.forEach((t, ci) => {
+      if (!t.outStation && !t.outPort) return
+      const m = t.main
+      for (let k = m.length - 2; k >= 1; k--) {
+        if (!straight(m, k) || !free(m[k][0], m[k][1])) continue
+        L.pilers!.push({
+          chain: ci,
+          x: m[k][0],
+          y: m[k][1],
+          dx: m[k + 1][0] - m[k][0],
+          dy: m[k + 1][1] - m[k][1],
+          itemId: L.chains[ci].itemId,
+        })
+        used.add(key(m[k][0], m[k][1]))
+        return
+      }
+      missed.push(name(L.chains[ci].itemId))
+    })
+    if (missed.length)
+      L.addonNotes.push(`产物「${missed.join('、')}」出线前没有能放自动集装机的直带，没集装`)
+  }
+
+  if (eff) {
+    // 1. 每条要喷的带挑几个能骑喷涂机的位置（在哪一段见文件开头）：压着的 3 格上不能有分拣器横穿、头顶不能有高架；取料格是它上游相邻的一格，
+    //    增产剂带要在取料格正上方一层横穿过去，所以取料格两侧那一层至少有一个方向是空的。取料格不用下游那格：喷涂机倒过来机身伸向上游，
+    //    接物流站时会撞站（game-rules 第 24 条）
+    const O0 = obstacles(L)
+    // 保护区（obstacles 里替接站的线、翘曲器带挡着的那几格）在这里放开给增产剂带横穿；
+    // 真有带子的格（保护区没护住时才会有）照旧是障碍，增产剂带不能从带子里穿过去
+    const unguard = (c: string) => {
+      if (!O0.real.has(c)) O0.belts.delete(c)
+    }
+    for (const [x, y] of O0.sprayGuard.guard2) for (const z of [1, 2]) unguard(cell(x, y, z))
+    for (const [x, y] of O0.sprayGuard.guard1) unguard(cell(x, y, 1))
+    for (const [x, y, z] of O0.sprayGuard.guardZ) unguard(cell(x, y, z)) // 高架上的窗口：头顶、两侧的保护区同样放开
+    for (const st of L.stations || [])
+      for (let dx = -3; dx <= 3; dx++)
+        for (let dy = -3; dy <= 3; dy++) O0.solid.add(key(st.x + dx, st.y + dy))
+    const W = L.width,
+      H = L.height
+    const inside = (x: number, y: number) => x >= 0 && y >= 0 && x < W && y < H
+    // 第 z1 层这一格能走增产剂带：没有带子（任何层的保护区已放开）、不在工厂和物流站身上
+    const air = (x: number, y: number, z1 = 1) =>
+      inside(x, y) && !O0.belts.has(cell(x, y, z1)) && !O0.solid.has(key(x, y)) && !nearStation(x, y)
+    const perpsOf = (ix: number, iy: number, ax: number, ay: number, z1 = 1) =>
+      [
+        [ay, ax],
+        [-ay, -ax],
+      ].filter(([px, py]) => air(ix - px, iy - py, z1) && air(ix + px, iy + py, z1))
+    // 分拣器横穿的格子（整根，从工厂边缘到所接的轨道）：喷涂机压着的 3 格、取料格都不能被横穿
+    const sorterSpan = new Set<string>()
+    for (const s of L.sorterList) {
+      const p = L.pos.get(s.bid)
+      const y0 = L.rowCy[p!.row] + (s.side === 'top' ? p!.g.edgeAbove : -p!.g.edgeBelow)
+      const y1 = L.segments[s.segId!].y
+      for (let y = Math.min(y0, y1); y <= Math.max(y0, y1); y++) sorterSpan.add(key(s.col, y))
+    }
+    // 每条链上的取放口在主链第几格
+    const segChain = new Map<number, number>()
+    L.chains.forEach((ch, ci) => {
+      for (const q of ch.parts) if (q.seg != null) segChain.set(q.seg, ci)
+    })
+    // 只喷最终产物的直接原料：只喷这几种物品的带；fin 是最终那几组的取料口
+    const onlyItems = new Set(sprayItems ?? [])
+    const finalGroups = new Set<string | number | undefined>(sprayTo ?? [])
+    const isFinal = (bid: string) => finalGroups.has(L.pos.get(bid)?.gid)
+    const tapsByChain = new Map<number, { x: number; y: number; io: string; fin: boolean }[]>() // ci -> [{x, y, io, fin}]
+    for (const s of L.sorterList) {
+      const ci = segChain.get(s.segId!)
+      if (ci == null) continue
+      if (!tapsByChain.has(ci)) tapsByChain.set(ci, [])
+      tapsByChain.get(ci)!.push({
+        x: s.col,
+        y: L.segments[s.segId!].y,
+        io: s.io,
+        fin: s.io === 'in' && isFinal(s.bid),
+      })
+    }
+    // 箱子供货（plan/storage.js）：储物仓往进料带上放料的分拣器也是放料口，喷涂机要在它们下游；仓从成品带上取料不进工厂，不算最终那几组
+    L.chains.forEach((ch, ci) => {
+      for (const q of ch.parts) {
+        const st = q.leg != null ? L.stores?.[L.legs[q.leg].store!] : null
+        if (!st) continue
+        if (!tapsByChain.has(ci)) tapsByChain.set(ci, [])
+        for (const so of st.sorters)
+          tapsByChain
+            .get(ci)!
+            .push({ x: so.belt[0], y: so.belt[1], io: st.kind === 'in' ? 'out' : 'in', fin: false })
+      }
+    })
+    // 过喷涂机的料：最终那几组取的，加上接着送去成品出口的（别的消费者在喷涂机上游取走了）
+    const sprayedRate = (ch: Layout['chains'][number]) => {
+      let r = 0
+      for (const q of ch.parts) {
+        if (q.seg != null)
+          for (const t of L.segments[q.seg].taps)
+            if (t.io === 'in' && isFinal(t.bid)) r += t.rate * (L.pos.get(t.bid)?.n ?? 1)
+        if (q.leg != null && L.legs[q.leg].kind === 'out') r += L.legs[q.leg].rate
+      }
+      return r
+    }
+    const wants: Want[] = [] // 每条要喷的带：{chain, itemId, rate, options: [...]}
+    const missed: string[] = []
+    tiles.forEach((t, ci) => {
+      const taps = tapsByChain.get(ci) || []
+      if (!onlyItems.has(baseItem(L.chains[ci].itemId))) return // 不是最终产物的直接原料，不喷
+      if (!taps.some((q) => q.fin)) return // 没有（最终那几组的）取料口：不进工厂（成品、副产物）或只进上游的工厂，不用喷
+      const m = t.main
+      const idxOf = new Map<string, number>()
+      m.forEach(([x, y, z], i) => {
+        if (!z && !idxOf.has(key(x, y))) idxOf.set(key(x, y), i)
+      })
+      let firstIn = Infinity // 第一个（最终那几组的）取料口
+      let lastOut = -1 // 最后一个放料口，或别的消费者最后一个取料口：喷涂机要在它们下游
+      let offMain = false // 劈开的死胡同那一半（extra）上的取料口：主链上喷不到它
+      for (const q of taps) {
+        const i = idxOf.get(key(q.x, q.y))
+        if (i == null) {
+          if (q.fin) offMain = true
+          continue // 死胡同那一半上的放料口：那些料到不了主链，不影响主链的喷涂位置
+        }
+        if (q.fin) firstIn = Math.min(firstIn, i)
+        else lastOut = Math.max(lastOut, i)
+      }
+      if (offMain || lastOut >= firstIn) {
+        // 取料口在劈开的死胡同上，或放料口排在取料口下游（交错）：喷不到。开喷增产剂的走线不会出这种链
+        missed.push(name(L.chains[ci].itemId))
+        return
+      }
+      const openStart = !t.inStation
+      const options: Coater[] = []
+      if (firstIn < Infinity)
+        for (let k = Math.max(1, lastOut + 2); k < firstIn - 1 && options.length < 40; k++) {
+          if (!coaterFits(m, k, openStart)) continue
+          const z = m[k][2] // 骑在第 z 层（0 地面；高架上的窗口见 layout/belts.js 的 legOut），增产剂带在 z+1 层横穿
+          if (z > MAX_COATER_Z) continue
+          const three = [m[k - 1], m[k], m[k + 1]] // 压着的 3 格
+          if (
+            three.some(
+              ([x, y]) =>
+                (z === 0 && sorterSpan.has(key(x, y))) ||
+                headBlocked(x, y, z) ||
+                used.has(key(x, y)) ||
+                nearStation(x, y),
+            )
+          )
+            continue
+          const ax = m[k + 1][0] - m[k][0],
+            ay = m[k + 1][1] - m[k][1]
+          const [ix, iy] = m[k - 1]
+          if (!air(ix, iy, z + 1)) continue
+          const perps = perpsOf(ix, iy, ax, ay, z + 1)
+          // 半边也算：另一侧贴着工厂过不去时，增产剂带可以从空的那一侧进来、在取料格上终止（死胡同，实测能喷，game-rules 第 28 条 Y 组）
+          const halfPerps = [
+            [ay, ax],
+            [-ay, -ax],
+          ].filter(([px, py]) => air(ix - px, iy - py, z + 1))
+          if (halfPerps.length) options.push({ x: m[k][0], y: m[k][1], z, ix, iy, perps, halfPerps })
+        }
+      // 边缘入口一进来就有分拣器取料：把入口往外接出两节（入口原地升起时三节），喷涂机骑在外面，取料格在最外面
+      if (
+        !options.length &&
+        t.inPort &&
+        !t.inStation &&
+        !L.chains[ci].parts.some((q) => q.leg != null && L.legs[q.leg].store != null)
+      ) {
+        const part = L.chains[ci].parts.find((q) => q.leg != null && L.legs[q.leg].kind === 'in')
+        const leg = part && L.legs[part.leg!]
+        const port = L.ports.find((q) => q.leg === part?.leg && q.kind === 'in')
+        if (leg && port && !leg.pre) {
+          const [x0, y0] = m[0]
+          const dx = x0 < W / 2 ? -1 : 1 // 往外
+          for (const n of [2, 3]) {
+            const pre = Array.from({ length: n }, (_, i): Tile => [x0 + (n - i) * dx, y0, 0])
+            // 往外接的 n 节 + 原来的头两格：喷涂机骑在 pre[1]，压着的 3 格到带头，再往里一格也得顺着同一方向、在地面
+            const clear =
+              pre.every(
+                ([x, y]) =>
+                  inside(x, y) &&
+                  !O0.belts.has(cell(x, y, 0)) &&
+                  !O0.solid.has(key(x, y)) &&
+                  !O0.ground.has(key(x, y)) &&
+                  air(x, y),
+              ) && coaterFits([...pre, ...m.slice(0, 2)], 1, true)
+            if (!clear) continue
+            const perps = perpsOf(pre[0][0], y0, -dx, 0)
+            const halfPerps = [
+              [0, -dx],
+              [0, dx],
+            ].filter(([px, py]) => air(pre[0][0] - px, y0 - py))
+            if (halfPerps.length) {
+              options.push({
+                x: pre[1][0],
+                y: y0,
+                z: 0,
+                ix: pre[0][0],
+                iy: y0,
+                perps,
+                halfPerps,
+                pre: { leg, port, cells: pre },
+              })
+              break
+            }
+          }
+        }
+      }
+      if (options.length)
+        wants.push({
+          chain: ci,
+          itemId: L.chains[ci].itemId,
+          rate: sprayedRate(L.chains[ci]) / eff.sprays,
+          options,
+        })
+      else missed.push(name(L.chains[ci].itemId))
+    })
+    alignCoaters(wants, (x, y) => !air(x, y))
+    // 2. 增产剂带：每条从一个源头出来，依次横穿就近的喷涂机背后那格。障碍是工厂、物流站、已有的带子（各层）、分拣器（地面）、已开的增产剂带，
+    //    集装机和选定的喷涂机头顶两层、往外接的入口那几节地面，边缘出入口往外那一行的地面（portRays：增产剂带只能从头顶横穿，不挡别的口）
+    const O = {
+      ...O0,
+      belts: new Set(O0.belts),
+      ground: new Set([...O0.ground, ...portRays(L).map(([x, y]) => key(x, y))]),
+    }
+    for (const w of wants)
+      for (const o of w.options) for (const c of o.pre?.cells ?? []) O.belts.add(cell(...c))
+    for (const p of L.pilers) for (const z of [1, 2]) O.belts.add(cell(p.x, p.y, z))
+    // 障碍的格子版（obstacleGrid）：带子集合每加一格，网格的 belts 层跟着改（put）
+    O.grid = obstacleGrid(O, W, H, PRO_MAX_Z)
+    const mark = (T: typeof O, x: number, y: number, z: number, b: number) => {
+      if (
+        Number.isInteger(x) &&
+        Number.isInteger(y) &&
+        Number.isInteger(z) &&
+        x >= 0 &&
+        y >= 0 &&
+        z >= 0 &&
+        x < W &&
+        y < H &&
+        z <= PRO_MAX_Z
+      )
+        T.grid!.belts[(z * H + y) * W + x] = b
+    }
+    const put = (T: typeof O, [x, y, z]: number[]) => {
+      T.belts.add(cell(x, y, z))
+      mark(T, x, y, z, 1)
+    }
+    // 试串一个源头时只改网格（tput / tdrop，记下改前的值），串完照 undo 改回去；试串时问带子也只问网格（hasB）：
+    // 试串里问到、改到的格子都在网格里（取料格、出口格、喷涂机头顶都先判过 inside / air，路上的格子是寻路给的）
+    const GB = O.grid.belts
+    const undo: number[] = []
+    const inGrid = (x: number, y: number, z: number) =>
+      Number.isInteger(x) &&
+      Number.isInteger(y) &&
+      Number.isInteger(z) &&
+      x >= 0 &&
+      y >= 0 &&
+      z >= 0 &&
+      x < W &&
+      y < H &&
+      z <= PRO_MAX_Z
+    const tset = ([x, y, z]: number[], b: number) => {
+      if (!inGrid(x, y, z)) return
+      const i = (z * H + y) * W + x
+      undo.push(i, GB[i])
+      GB[i] = b
+    }
+    const tput = (c: number[]) => tset(c, 1)
+    const tdrop = (c: number[]) => tset(c, 0)
+    const hasB = (x: number, y: number, z: number) =>
+      inGrid(x, y, z) ? GB[(z * H + y) * W + x] === 1 : O.belts.has(cell(x, y, z))
+    // 工厂、物流站、仓身（包括正在试的增产剂仓）：横穿喷涂机背后那格时前后两格也不能落在上面
+    const solidAt = ([x, y]: number[]) => inside(x, y) && O.grid!.solid[y * W + x] === 1
+    const unserved = []
+    let todoAll = wants.slice()
+    while (todoAll.length) {
+      const all = todoAll.flatMap((w) => w.options)
+      const cx = all.reduce((a, c) => a + c.ix, 0) / Math.max(1, all.length)
+      const cy = all.reduce((a, c) => a + c.iy, 0) / Math.max(1, all.length)
+      // 源头：有站就用站的空口（优先已经存了增产剂的站；没存的站要有空的物品格才行），否则从左右边缘进来
+      const sources: Source[] = []
+      ;(L.stations || []).forEach((st, k) => {
+        const hasPro = st.items.some((it) => realItem(it.itemId) === eff.item)
+        if (!hasPro && st.items.length >= 5) return
+        const usedSlots = new Set(st.ports.map((p) => p.slot))
+        for (const q of STATION_PORTS) {
+          if (usedSlots.has(q.slot)) continue
+          const stub = [0, 1, 2].map((d): Tile => [
+            st.x + q.dx + q.nx * d,
+            st.y + q.dy + q.ny * d,
+            0,
+          ])
+          if (stub.some(([x, y]) => !inside(x, y) || O.belts.has(cell(x, y, 0)))) continue
+          const s = stub[2]
+          if (O.solid.has(key(s[0], s[1])) || O.ground.has(key(s[0], s[1]))) continue
+          sources.push({
+            start: s,
+            dir: dirIndex(q.nx, q.ny),
+            lead: stub.slice(0, 2),
+            station: { k, slot: q.slot },
+            needsItem: !hasPro,
+            d: Math.abs(s[0] - cx) + Math.abs(s[1] - cy),
+          })
+        }
+      })
+      if (!L.stations?.length) {
+        // 箱子供货：先在蓝图里面的空地上放一叠增产剂仓（storage.js 的 storeSites），带子从仓下面那截进料带出发；放不下才从左右边缘进来、
+        // 在外面接仓组（storage.js 的 addProStores）
+        if (supply) {
+          const free = (x: number, y: number) => {
+            if (O.solid.has(key(x, y)) || O.ground.has(key(x, y)) || O0.projection.has(key(x, y)))
+              return false
+            for (let z = 0; z <= PRO_MAX_Z; z++) if (hasB(x, y, z)) return false
+            return true
+          }
+          const rate = todoAll.reduce((a, w) => a + w.rate, 0)
+          for (const site of storeSites({
+            itemId: eff.item,
+            rate,
+            supply,
+            sorter,
+            maxLayers,
+            W,
+            H,
+            free,
+            cx,
+            cy,
+          }))
+            sources.push({
+              start: [...site.store.gate, 0],
+              dir: dirIndex(-site.store.side, 0),
+              lead: site.feed,
+              station: null,
+              needsItem: false,
+              site,
+              d: site.d,
+            })
+        }
+        for (const [x, nx] of [
+          [0, 1],
+          [W - 1, -1],
+        ])
+          for (let y = 0; y < H; y++) {
+            if (
+              O.belts.has(cell(x, y, 0)) ||
+              O.solid.has(key(x, y)) ||
+              O.ground.has(key(x, y)) ||
+              O.belts.has(cell(x + nx, y, 0))
+            )
+              continue
+            sources.push({
+              start: [x, y, 0],
+              dir: dirIndex(nx, 0),
+              lead: [],
+              station: null,
+              needsItem: false,
+              d: Math.abs(x - cx) + Math.abs(y - cy),
+            })
+          }
+      }
+      sources.sort((a, b) => (a.needsItem ? 1 : 0) - (b.needsItem ? 1 : 0) || a.d - b.d)
+      // 蓝图里面的仓位、边缘各试最近的 8 个；串上的台数一样时用里面的仓
+      const tries = [
+        ...sources.filter((q) => q.site).slice(0, 8),
+        ...sources.filter((q) => !q.site).slice(0, 8),
+      ]
+      let best: { done: { w: Want; o: Coater }[]; cells: Tile[]; src: Source } | null = null
+      const better = (n: number, inside: Site | undefined, len: number) =>
+        !best ||
+        n > best.done.length ||
+        (n === best.done.length &&
+          (!!inside !== !!best.src.site ? !!inside : len < best.cells.length))
+      for (const src of tries) {
+        const cells = [...src.lead, src.start]
+        for (const c of cells) tput(c)
+        // 试的仓位：仓身那几格当工厂挡住（进料带那一行已经当带子放上了）
+        const solidUndo = []
+        if (src.site) {
+          const r = src.site.store.rect
+          for (let x = r[0]; x <= r[2]; x++)
+            for (let y = r[1] + 1; y <= r[3]; y++) {
+              const i = y * W + x
+              solidUndo.push(i, O.grid.solid[i])
+              O.grid.solid[i] = 1
+            }
+        }
+        // 还没接到的取料格先当障碍，免得增产剂带顺路压过去（方向不对）
+        for (const o of all) tput([o.ix, o.iy, o.z + 1])
+        let cur = src.start
+        let dir = src.dir
+        const todo = todoAll.slice()
+        const done: { w: Want; o: Coater }[] = []
+        let hopeless = false
+        while (todo.length) {
+          // 剩下的全串上也比不过已有的最好那条（串的台数少，或者一样多但带子已经不比它短）：这个源头不用再串下去，结果一样
+          if (
+            best &&
+            (done.length + todo.length < best.done.length ||
+              (done.length + todo.length === best.done.length && cells.length >= best.cells.length))
+          ) {
+            hopeless = true
+            break
+          }
+          const dist = (w: Want) =>
+            Math.min(...w.options.map((o) => Math.abs(o.ix - cur[0]) + Math.abs(o.iy - cur[1])))
+          todo.sort((a, b) => dist(a) - dist(b))
+          const w = todo.shift()!
+          let got: { o: Coater; cells: Tile[]; cost: number; dir: number; dead?: boolean } | null =
+            null
+          for (const o of w.options) {
+            // 取料格一直当障碍（找的是到它前面那格 a 的路）：不然路会先穿过取料格走到 a、再掉头横穿回来，增产剂带压回自己
+            const head = [o.z + 1, o.z + 2]
+              .filter((z) => !hasB(o.x, o.y, z))
+              .map((z) => [o.x, o.y, z])
+            for (const c of head) tput(c)
+            for (const [px, py] of o.perps) {
+              const a: Tile = [o.ix - px, o.iy - py, o.z + 1]
+              const b: Tile = [o.ix + px, o.iy + py, o.z + 1]
+              // 出口那格正好是另一条要喷的带的取料格、而且也是横穿：可以接着穿过去（一条增产剂带顺路喂两台喷涂机）
+              const serves = (x: number, y: number) =>
+                todo.some((w2) =>
+                  w2.options.some(
+                    (o2) =>
+                      o2.ix === x &&
+                      o2.iy === y &&
+                      o2.perps.some(
+                        ([qx, qy]) => Math.abs(qx) === Math.abs(px) && Math.abs(qy) === Math.abs(py),
+                      ),
+                  ),
+                )
+              if (hasB(...a) || (hasB(...b) && !serves(b[0], b[1])) || solidAt(a) || solidAt(b))
+                continue
+              // 出口那格找路时也不许经过（不然先路过出口、再从 a 横穿回来，同样压回自己）
+              const bFree = !hasB(...b)
+              if (bFree) tput(b)
+              // 已经有一条了：只要更短的（pathfind 的 cut，返回 CUT 时原来找到的也不比它短）
+              const path: ReturnType<typeof pathfind> = pathfind(
+                cur,
+                a,
+                O,
+                W,
+                H,
+                PRO_MAX_Z,
+                dir,
+                null,
+                dirIndex(px, py),
+                got ? got.cost : Infinity,
+              )
+              if (bFree) tdrop(b)
+              if (path && !('cut' in path) && (!got || path.cost < got.cost))
+                got = {
+                  o,
+                  cells: [...path.cells.slice(1), [o.ix, o.iy, o.z + 1], b],
+                  cost: path.cost,
+                  dir: dirIndex(px, py),
+                }
+            }
+            tput([o.ix, o.iy, o.z + 1])
+            if (got) break
+            for (const c of head) tdrop(c)
+          }
+          // 退路：横穿不过去（比如另一侧贴着工厂）时，带子从空的那一侧进来、在取料格上终止。
+          // 死胡同终点落在取料格上，这条增产剂带到此为止，剩下的喷涂机让下一条线管
+          if (!got)
+            for (const o of w.options) {
+              const head = [o.z + 1, o.z + 2]
+                .filter((z) => !hasB(o.x, o.y, z))
+                .map((z) => [o.x, o.y, z])
+              for (const c of head) tput(c)
+              for (const [px, py] of o.halfPerps) {
+                const a: Tile = [o.ix - px, o.iy - py, o.z + 1] // 空的那一侧：先到它，再横着迈进取料格
+                if (hasB(...a) || solidAt(a)) continue
+                const path: ReturnType<typeof pathfind> = pathfind(
+                  cur,
+                  a,
+                  O,
+                  W,
+                  H,
+                  PRO_MAX_Z,
+                  dir,
+                  null,
+                  dirIndex(px, py),
+                  got ? got.cost : Infinity,
+                )
+                if (path && !('cut' in path) && (!got || path.cost < got.cost))
+                  got = {
+                    o,
+                    cells: [...path.cells.slice(1), [o.ix, o.iy, o.z + 1]],
+                    cost: path.cost,
+                    dir: dirIndex(px, py),
+                    dead: true,
+                  }
+              }
+              tput([o.ix, o.iy, o.z + 1])
+              if (got) break
+              for (const c of head) tdrop(c)
+            }
+          if (!got) continue
+          for (const p of got.cells) tput(p)
+          cells.push(...got.cells)
+          cur = got.cells.at(-1)!
+          dir = got.dir
+          done.push({ w, o: got.o })
+          if (got.dead) break // 死胡同终点：这条线到头了
+          // 顺路：现在停在别的要喷的带的取料格上（方向横穿），再往前走一格就把那台也喂上
+          for (;;) {
+            const [dx, dy] = [
+              [1, 0],
+              [-1, 0],
+              [0, 1],
+              [0, -1],
+            ][dir]
+            const hit = todo.findIndex((w2) =>
+              w2.options.some(
+                (o2) =>
+                  o2.ix === cur[0] &&
+                  o2.iy === cur[1] &&
+                  o2.z + 1 === cur[2] &&
+                  o2.perps.some(
+                    ([qx, qy]) => Math.abs(qx) === Math.abs(dx) && Math.abs(qy) === Math.abs(dy),
+                  ),
+              ),
+            )
+            const nxt: Tile = [cur[0] + dx, cur[1] + dy, cur[2]]
+            if (
+              hit < 0 ||
+              !inside(nxt[0], nxt[1]) ||
+              hasB(...nxt) ||
+              O.solid.has(key(nxt[0], nxt[1])) ||
+              solidAt(nxt)
+            )
+              break
+            const w2 = todo.splice(hit, 1)[0]
+            const o2 = w2.options.find(
+              (q) => q.ix === cur[0] && q.iy === cur[1] && q.z + 1 === cur[2],
+            )
+            for (const z of [o2!.z + 1, o2!.z + 2]) tput([o2!.x, o2!.y, z])
+            tput(nxt)
+            cells.push(nxt)
+            cur = nxt
+            done.push({ w: w2, o: o2! })
+          }
+        }
+        // 网格改回试串这个源头之前
+        for (let u = undo.length - 2; u >= 0; u -= 2) GB[undo[u]] = undo[u + 1]
+        undo.length = 0
+        for (let u = solidUndo.length - 2; u >= 0; u -= 2)
+          O.grid.solid[solidUndo[u]] = solidUndo[u + 1]
+        if (!hopeless && done.length && better(done.length, src.site, cells.length)) {
+          best = { done, cells, src }
+          if (done.length === todoAll.length) break
+        }
+      }
+      if (!best) break // 没有源头或一台都串不上：剩下的记为接不上
+      // 把这条线落到实处
+      for (const { w, o } of best.done) {
+        L.coaters.push({
+          chain: w.chain,
+          x: o.x,
+          y: o.y,
+          z: o.z,
+          ix: o.ix,
+          iy: o.iy,
+          itemId: w.itemId,
+        })
+        used.add(key(o.x, o.y))
+        for (const z of [o.z + 1, o.z + 2]) put(O, [o.x, o.y, z]) // 后开的线让开这台喷涂机的头顶
+        if (o.pre) {
+          o.pre.leg.pre = o.pre.cells
+          o.pre.port.x = o.pre.cells[0][0]
+          L.belts += o.pre.cells.length
+        }
+      }
+      for (const c of best.cells) put(O, c)
+      const rate = best.done.reduce((a, { w }) => a + w.rate, 0)
+      const site = best.src.site
+      if (site) {
+        // 蓝图里面的增产剂仓：仓身挡住后开的线
+        L.stores ||= []
+        L.stores.push({
+          ...site.store,
+          rate,
+          minutes: (site.store.minutes * site.store.rate) / Math.max(rate, 1e-9),
+          leg: null,
+          pro: true,
+          inside: true,
+        })
+        const r = site.store.rect
+        for (let x = r[0]; x <= r[2]; x++)
+          for (let y = r[1] + 1; y <= r[3]; y++) {
+            O.solid.add(key(x, y))
+            O.grid.solid[y * W + x] = 1
+          }
+      }
+      L.proLines.push({
+        cells: best.cells,
+        station: best.src.station,
+        itemId: eff.item,
+        rate,
+        edge: best.src.station || site ? null : (best.src.start.slice(0, 2) as Cell),
+        ...(site ? { store: L.stores!.length - 1 } : null),
+      })
+      if (best.src.station) {
+        const st = L.stations[best.src.station.k]
+        if (!st.items.some((it) => realItem(it.itemId) === eff.item))
+          st.items.push({ itemId: eff.item, role: 'demand' })
+        st.ports.push({ slot: best.src.station.slot, itemId: eff.item, dir: 'out', spray: true })
+      } else if (!site) {
+        L.ports.push({
+          kind: 'in',
+          itemId: eff.item,
+          x: best.src.start[0],
+          y: best.src.start[1],
+          rate,
+          spray: true,
+        })
+      }
+      L.belts += best.cells.length
+      L.airBelts += best.cells.filter((c) => c[2] > 0).length
+      const served = new Set(best.done.map((d) => d.w))
+      todoAll = todoAll.filter((w) => !served.has(w))
+    }
+    for (const w of todoAll) unserved.push(name(w.itemId))
+    L.sprayMissed = missed.length + unserved.length
+    if (missed.length)
+      L.addonNotes.push(`「${[...new Set(missed)].join('、')}」那条带没地方放喷涂机，没喷`)
+    if (unserved.length)
+      L.addonNotes.push(
+        `「${[...new Set(unserved)].join('、')}」的喷涂机接不上增产剂带（${L.stations?.length ? '物流站的空口、空的物品格不够用，或绕不过去' : '边缘没有空位'}），没喷`,
+      )
+    // 3. 裁掉没用到的边
+    let x0 = Infinity,
+      y0 = Infinity,
+      x1 = -Infinity,
+      y1 = -Infinity
+    const include = (x: number, y: number) => {
+      x0 = Math.min(x0, x)
+      y0 = Math.min(y0, y)
+      x1 = Math.max(x1, x)
+      y1 = Math.max(y1, y)
+    }
+    for (const p of L.pos.values()) {
+      const hw = (p.g.bodyWidth - 1) / 2
+      for (const c of p.centers) {
+        include(c - hw, L.rowCy[p.row] - p.g.bodyBelow)
+        include(c + hw, L.rowCy[p.row] + p.g.bodyAbove)
+      }
+    }
+    for (const st of L.stations || []) {
+      include(st.x - 3, st.y - 3)
+      include(st.x + 3, st.y + 3)
+    }
+    for (const ch of L.chains) {
+      const t = chainTiles(L, ch)
+      for (const [x, y] of [...t.main, ...t.extra.flat()]) include(x, y)
+    }
+    for (const p of L.ports) include(p.x, p.y)
+    for (const pl of L.proLines) for (const [x, y] of pl.cells) include(x, y)
+    for (const b of L.stores || []) {
+      include(b.rect[0], b.rect[1])
+      include(b.rect[2], b.rect[3])
+    } // 箱子供货的储物仓、储液罐（plan/storage.js）
+    translateLayout(L, -x0, -y0)
+    L.width = x1 - x0 + 1
+    L.height = y1 - y0 + 1
+  }
+  L.belts += L.pilers.length // 集装机那一格拆成两节带子
+  L.area = L.width * L.height
+  return L
+}

@@ -1,0 +1,966 @@
+import type { Building, Point2, Point3 } from '../codec/types.ts'
+import { narrowestEW } from '../gamedata.ts'
+// 分馏阵列压紧：array.ts 裁完、重新编号之前，直接改 all / removed（新放的电塔追加到 all 末尾，标签记进 tags）。
+// 只有两种动作，链接全保留：
+//   删线 tryLine：删第 c 行（列），或只删其中一段（= 剪切平移），一侧整体朝线挪一格。线上只许有顺着挪动方向直通的带子（删掉，前一节直接接后一节）
+//     和电塔（留在原地）；挪完不能有新的格子重叠、新的建造盒碰撞，剪切时供电覆盖、电塔连通不能断（细节见 lineAt、shift）。
+//   电塔：删多余的；全部拿掉重放。
+// 顺序（试出来最好的）：删行 → 删多余电塔 → 删行 → 站往循环那边剪切 → 删列 → 电塔重放后再删列、删行（包围盒变小、两边都没变长才留）。
+// 坐标是转 90° 之前的（默认照原图竖着出，就是出出来的蓝图的坐标）：x 东西向（离开赤道变窄），y 南北向（不变）。
+// 横着出（array.ts 的 orient 'h'）转完 y 成了东西向，这里不管，那种图只适合赤道附近。
+import { CELL_M, powerReach } from '../plan/power.ts'
+type Axis = 'x' | 'y'
+type Pair = [number, number]
+type Edge = [Building, Building]
+type Index<T = Building> = Map<number, T[]>
+type Getter = (index: number) => Building | null | undefined
+type View = ReturnType<typeof linkView>
+interface Memo {
+  cells: Index
+  x: Index
+  y: Index
+  preds: Index
+  edges: Edge[]
+  ex: Index<Edge>
+  ey: Index<Edge>
+  view: View
+  blocks: [Index, Index]
+}
+interface State {
+  all: Building[]
+  removed: Set<number>
+  tags: Map<number, string>
+  get: Getter
+  live: Building[]
+  memo: Partial<Memo>
+}
+interface Line {
+  axis: Axis
+  c: number
+  range: Pair | null
+  onLine: Building[]
+  links: [Building, Building, Building][]
+  teslas: Building[]
+}
+interface TeslaSite extends Point2 {
+  out: boolean
+  cov?: number[]
+  near?: boolean
+}
+
+const ST = 2104
+const FRAC = 2314
+const PILER = 2040
+const COATER = 2313
+const SPLIT = 2020
+const TESLA = 2201
+const POWERED = [FRAC, PILER, COATER, SPLIT, ST]
+const isBelt = (b: Building) => b.itemId >= 2001 && b.itemId <= 2003
+const P = (b: Building) => b.localOffset[0]
+const RX = (b: Building) => Math.round(P(b).x)
+const RY = (b: Building) => Math.round(P(b).y)
+const half = (b: Building) => (b.itemId === ST ? 3 : b.itemId === FRAC ? 1 : 0) // 占格：站 7×7、塔 3×3、别的 1 格
+const device = (b: Building) => !isBelt(b) && b.itemId !== TESLA
+const elev = (b: Building) => isBelt(b) && P(b).z > 0.25
+const K = (x: number, y: number) => (x + 512) * 2048 + y + 512 // 格子的数字键
+function push<T>(m: Index<T>, k: number, v: T) {
+  const a = m.get(k)
+  if (a) a.push(v)
+  else m.set(k, [v])
+}
+
+// 建造盒（米）：游戏数据里的 build 碰撞体（out/colliders，game-rules 第 35 条；没实测，推断）。每块 [中心 x、高、z，半宽 x、高、z]，z 是朝向 0 时的南北向；
+// 物流站、分流器是十字形的两块
+const BOX: Partial<Record<number, [number, number, number, number, number, number][]>> = {
+  [FRAC]: [[0, 4.5, 0, 2.25, 4.5, 2.25]],
+  [TESLA]: [[0, 2.9, 0, 0.3, 2.9, 0.3]],
+  [ST]: [
+    [0, 13, 0, 4, 13, 2.75],
+    [0, 13, 0, 2.75, 13, 4],
+  ],
+  [PILER]: [
+    [0, 1.26, 0.6, 0.5, 1.26, 0.775],
+    [0, 0.5, 0, 0.5, 0.5, 1.45],
+  ],
+  [COATER]: [
+    [0, 0.45, 0.15, 0.35, 0.45, 1.75],
+    [0, 1.25, -0.6, 0.35, 1.25, 1],
+  ],
+  [SPLIT]: [
+    [0, 1.15, 0, 0.625, 1.15, 1.19],
+    [0, 1.15, 0, 1.19, 1.15, 0.625],
+  ],
+}
+// 东西向格宽（赤道的几分之几）：一张蓝图要整张落在同一条纬度带里（game-rules 第 41 条），分馏阵列最矮的（1 塔）也有 18 行，
+// 高于 15 行的东西向最窄是赤道的 0.8516（gamedata.ts 的 narrowestEW）。压紧时东西向都按这个判，南北向格子不随纬度变（第 26 条）；
+// 出图以后 array.ts 的 checkArray 再按这张图自己的行数能到的最窄纬度扫一遍
+export const EW = narrowestEW(16)
+const HZ = 1.3333333 // 高度 z 每 1 是多少米
+const BELT_R = 0.23 // 带子：带子点往上 0.2 m、半径 0.23 m 的球
+const TESLA_GAP2 = 12.25 // 电塔之间中心距 < 3.5 m 放不下
+// 水平方向离中心最远多少米（几块盒子的外框；带子是球的半径再加胶囊偏出去的最远 1.2 m，见 beltCapsule）：两座隔得比两个加起来还远就不可能撞（电塔之间按 3.5 m）
+const REACH: Record<number, number> = {
+  [FRAC]: 2.25,
+  [TESLA]: 0.3,
+  [ST]: 4,
+  [PILER]: 1.45,
+  [COATER]: 1.9,
+  [SPLIT]: 1.19,
+}
+const BELT_REACH = BELT_R + 1.2
+const reachOf = (b: Building) => (isBelt(b) ? BELT_REACH : (REACH[b.itemId] ?? 0))
+const COS = [1, 0, -1, 0]
+const SIN = [0, 1, 0, -1]
+const quarter = (b: Building) => ((Math.round(b.yaw[0] / 90) % 4) + 4) % 4
+
+/** 两座设备的建造盒（几块里任意两块）三个方向都重叠（贴着也算）就撞；ew：东西向格宽是赤道的几分之几 */
+function boxHit(a: Building, pa: Point3, b: Building, pb: Point3, ew: number) {
+  const A = BOX[a.itemId],
+    B = BOX[b.itemId]
+  if (!A || !B) return false
+  const qa = quarter(a),
+    qb = quarter(b)
+  const ca = COS[qa],
+    sa = SIN[qa],
+    cb = COS[qb],
+    sb = SIN[qb]
+  const xa = pa.x * CELL_M * ew,
+    ya = pa.y * CELL_M,
+    za = 0.2 + (pa.z ?? 0) * HZ
+  const xb = pb.x * CELL_M * ew,
+    yb = pb.y * CELL_M,
+    zb = 0.2 + (pb.z ?? 0) * HZ
+  for (const [p0, p1, p2, e0, e1, e2] of A) {
+    const ax = xa + ca * p0 + sa * p2,
+      ay = ya - sa * p0 + ca * p2
+    const aex = Math.abs(ca) * e0 + Math.abs(sa) * e2,
+      aey = Math.abs(sa) * e0 + Math.abs(ca) * e2
+    const ah0 = za + p1 - e1,
+      ah1 = za + p1 + e1
+    for (const [q0, q1, q2, f0, f1, f2] of B) {
+      const bx = xb + cb * q0 + sb * q2,
+        by = yb - sb * q0 + cb * q2
+      if (Math.abs(ax - bx) > aex + Math.abs(cb) * f0 + Math.abs(sb) * f2) continue
+      if (Math.abs(ay - by) > aey + Math.abs(sb) * f0 + Math.abs(cb) * f2) continue
+      if (ah0 <= zb + q1 + f1 && zb + q1 - f1 <= ah1) return true
+    }
+  }
+  return false
+}
+// ---- 带子碰建筑（贴蓝图时的判法，BuildTool_BlueprintPaste.CheckBuildConditions，游戏 0.10.35 反编译，没实测；game-rules 第 35、42 条） ----
+//   第一遍：带子节点往上 0.2 m、半径 0.23 m 的球碰到别的建筑的建造盒就记「撞」；
+//   第二遍只复查第一遍撞了的：前后都是带子的节点换成一小段胶囊（往前、往后那节的 0.65 处再各往回收 0.45：直带只有节点前后 0.065 格，
+//     拐弯处偏向内角约 0.46 格），碰到的建筑若顺着链接 3 节以内就放过（往后数 output、往前数 input，input 怎么认见 linkView）；
+//     还有一条：直接接着某座建筑、那座建筑本身能放的带子一律放过。
+// 这里取严的一边：球或胶囊碰到不放过的建筑就算撞（不管第一遍撞没撞，也不认「直接接着建筑」那条）。
+// 喷涂机（带子附件）和带子之间不查：游戏按附件区判，要预制体里的数据，没取到；原图里压着、挨着喷涂机的带子都能贴（推断）
+/** 点到盒子（中心 c、半宽 e，三个方向）的距离平方 */
+function boxD2(
+  x: number,
+  y: number,
+  h: number,
+  cx: number,
+  cy: number,
+  ch: number,
+  ex: number,
+  ey: number,
+  eh: number,
+) {
+  const dx = Math.max(0, Math.abs(x - cx) - ex),
+    dy = Math.max(0, Math.abs(y - cy) - ey),
+    dh = Math.max(0, Math.abs(h - ch) - eh)
+  return dx * dx + dy * dy + dh * dh
+}
+/** 带子的球（pt）或胶囊（cap：两头的格坐标，高度同节点，游戏把两头投到节点那个半径上）碰设备 o 的建造盒 */
+function beltHit(pt: Point3, cap: [Point2, Point2] | null, o: Building, po: Point3, ew: number) {
+  const B = BOX[o.itemId]
+  if (!B) return false
+  const q = quarter(o),
+    c = COS[q],
+    s = SIN[q]
+  const ch = 0.2 + (pt.z ?? 0) * HZ + 0.2
+  const xb = po.x * CELL_M * ew,
+    yb = po.y * CELL_M,
+    zb = 0.2 + (po.z ?? 0) * HZ
+  const r2 = BELT_R * BELT_R
+  for (const [q0, q1, q2, f0, f1, f2] of B) {
+    const bx = xb + c * q0 + s * q2,
+      by = yb - s * q0 + c * q2,
+      bh = zb + q1
+    const ex = Math.abs(c) * f0 + Math.abs(s) * f2,
+      ey = Math.abs(s) * f0 + Math.abs(c) * f2
+    if (boxD2(pt.x * CELL_M * ew, pt.y * CELL_M, ch, bx, by, bh, ex, ey, f1) <= r2) return true
+    if (!cap) continue
+    // 胶囊：线段到盒子的距离平方沿线段是凸的，三分法找最小
+    const [u, v] = cap
+    const at = (t: number) =>
+      boxD2(
+        (u.x + (v.x - u.x) * t) * CELL_M * ew,
+        (u.y + (v.y - u.y) * t) * CELL_M,
+        ch,
+        bx,
+        by,
+        bh,
+        ex,
+        ey,
+        f1,
+      )
+    let lo = 0,
+      hi = 1
+    for (let k = 0; k < 30; k++) {
+      const m1 = lo + (hi - lo) / 3,
+        m2 = hi - (hi - lo) / 3
+      if (at(m1) <= at(m2)) hi = m2
+      else lo = m1
+    }
+    if (Math.min(at(0), at(1), at((lo + hi) / 2)) <= r2) return true
+  }
+  return false
+}
+/**
+ * 链接视图：pos(b) 位置；out(b) 下一节；inn(b) 游戏认的上一节（往它送的带子里编号最大的那节，没有就是蓝图里记的来源建筑）。
+ * get(i) 给第 i 座（删掉的给 null），preds(b) 给往 b 送的带子
+ */
+function linkView(get: Getter, preds: (b: Building) => Building[], pos = P) {
+  return {
+    pos,
+    out: (b: Building) => get(b.outputObjIdx),
+    inn: (b: Building) => {
+      const pr = preds(b)
+      if (pr.length) return pr.reduce((m, q) => (q.index > m.index ? q : m))
+      return get(b.inputObjIdx)
+    },
+    /** 往 b 送的带子有几节（并带点 ≥ 2） */
+    npred: (b: Building) => preds(b).length,
+  }
+}
+/**
+ * 带子 belt 和建筑 dev 隔着 3 节以内的链接（游戏放过的那几种）。
+ * strict（集装机用）：往前数时碰到并带点（有两节以上带子往它送）就停，不经过并带点放过：
+ * 集装机的建造盒罩住并带点时，照反编译的代码该放过，实测不放过（原因没查清，推断；game-rules 第 43 条）
+ */
+function linked(view: View, belt: Building, dev: Building, strict = false) {
+  for (const step of [view.out, view.inn]) {
+    let c = belt
+    for (let k = 0; k < 3; k++) {
+      if (strict && step === view.inn && view.npred(c) > 1) break
+      const n = step(c)
+      if (!n) break
+      if (n === dev) return true
+      if (!isBelt(n)) break
+      c = n
+    }
+  }
+  return false
+}
+/** 前后都是带子的节点的胶囊（两头的格坐标）；不是就给 null */
+function beltCapsule(view: View, belt: Building): [Point2, Point2] | null {
+  const i = view.inn(belt),
+    o = view.out(belt)
+  if (!i || !o || !isBelt(i) || !isBelt(o)) return null
+  const p = view.pos(belt),
+    pi = view.pos(i),
+    po = view.pos(o)
+  const a = { x: p.x + (pi.x - p.x) * 0.65, y: p.y + (pi.y - p.y) * 0.65 }
+  const b = { x: p.x + (po.x - p.x) * 0.65, y: p.y + (po.y - p.y) * 0.65 }
+  const dx = b.x - a.x,
+    dy = b.y - a.y
+  return [
+    { x: a.x + dx * 0.45, y: a.y + dy * 0.45 },
+    { x: b.x - dx * 0.45, y: b.y - dy * 0.45 },
+  ]
+}
+/**
+ * a、b 放在 pa、pb（格，带 z）撞不撞：设备之间比建造盒；带子按球和胶囊碰设备的盒子，顺着链接 3 节以内的设备、喷涂机放行（见上）；
+ * 带子和带子不查（游戏也不查）；电塔之间中心距 < 3.5 m 撞。view 给链接和带子前后节的位置（带子那头的位置要和 view.pos 一致）；
+ * ew：东西向格宽是赤道的几分之几（压紧时都按最窄的 EW）
+ */
+function collide(a: Building, pa: Point3, b: Building, pb: Point3, view: View, ew = EW) {
+  const ba = isBelt(a),
+    bb = isBelt(b)
+  if (ba && bb) return false
+  if (
+    a.itemId === TESLA &&
+    b.itemId === TESLA &&
+    ((pa.x - pb.x) * ew) ** 2 * CELL_M * CELL_M + (pa.y - pb.y) ** 2 * CELL_M * CELL_M < TESLA_GAP2
+  )
+    return true
+  if (ba || bb) {
+    const [belt, pt, o, po]: [Building, Point3, Building, Point3] = ba
+      ? [a, pa, b, pb]
+      : [b, pb, a, pa]
+    if (o.itemId === COATER || linked(view, belt, o, o.itemId === PILER)) return false
+    return beltHit(pt, beltCapsule(view, belt), o, po, ew)
+  }
+  return boxHit(a, pa, b, pb, ew)
+}
+
+/**
+ * 整张图两两扫一遍碰撞（同上的规则）：B 是解码后按 index 排好的建筑，坐标就是贴的时候的（x 东西向），
+ * ew 东西向格宽是赤道的几分之几（1 是赤道，默认压紧用的最窄 EW）。撞的对子 [i, j]
+ */
+export function collisions(B: Building[], ew = EW): Pair[] {
+  const preds: Index = new Map()
+  for (const b of B)
+    if (isBelt(b) && b.outputObjIdx >= 0 && isBelt(B[b.outputObjIdx])) push(preds, b.outputObjIdx, b)
+  const view = linkView(
+    (i) => (i >= 0 ? B[i] : null),
+    (b) => preds.get(b.index) ?? [],
+  )
+  const pos = B.map(P)
+  const order = B.map((_, i) => i).sort((i, j) => pos[i].x - pos[j].x)
+  const out: Pair[] = []
+  for (let u = 0; u < order.length; u++) {
+    const i = order[u]
+    for (let v = u + 1; v < order.length && pos[order[v]].x - pos[i].x <= 7; v++) {
+      const j = order[v]
+      if (Math.abs(pos[i].y - pos[j].y) > 7) continue
+      const [a, b] = i < j ? [i, j] : [j, i]
+      if (collide(B[a], pos[a], B[b], pos[b], view, ew)) out.push([a, b])
+    }
+  }
+  return out.sort((p, q) => p[0] - q[0] || p[1] - q[1])
+}
+
+// ---- 压紧用的状态 S = { all, removed, tags, get, live, memo }：live 和下面几个索引每改一次重算 ----
+function refresh(S: State) {
+  S.live = S.all.filter((b) => !S.removed.has(b.index))
+  S.memo = {}
+}
+const memo = <K extends keyof Memo>(S: State, k: K, f: () => Memo[K]): Memo[K] =>
+  S.memo[k] ?? (S.memo[k] = f())
+/** 格子 → 压着它的建筑（地面、高架都算） */
+const cellsOf = (S: State) =>
+  memo(S, 'cells', () => {
+    const m: Index = new Map()
+    for (const b of S.live) {
+      const h = half(b),
+        x = RX(b),
+        y = RY(b)
+      for (let dx = -h; dx <= h; dx++) for (let dy = -h; dy <= h; dy++) push(m, K(x + dx, y + dy), b)
+    }
+    return m
+  })
+/** 第几列（axis 'x'）/ 行（'y'）→ 压着它的建筑 */
+const linesOf = (S: State, axis: Axis) =>
+  memo(S, axis, () => {
+    const m: Index = new Map()
+    const A = axis === 'x' ? RX : RY
+    for (const b of S.live) for (let i = -half(b); i <= half(b); i++) push(m, A(b) + i, b)
+    return m
+  })
+/** 带子 → 接进它的带子 */
+const predsOf = (S: State) =>
+  memo(S, 'preds', () => {
+    const m: Index = new Map()
+    for (const b of S.live) if (isBelt(b) && S.get(b.outputObjIdx)) push(m, b.outputObjIdx, b)
+    return m
+  })
+/** 留着的链接 [从, 到]：outputObjIdx 是 b → o，inputObjIdx 是 o → b */
+const edgesOf = (S: State) =>
+  memo(S, 'edges', () => {
+    const out: Edge[] = []
+    for (const b of S.live) {
+      const o = S.get(b.outputObjIdx)
+      if (o) out.push([b, o])
+      const i = S.get(b.inputObjIdx)
+      if (i) out.push([i, b])
+    }
+    return out
+  })
+/** 第几列 / 行 → 两头跨过（或压着）它的链接 */
+const edgesAt = (S: State, axis: Axis) =>
+  memo(S, `e${axis}`, () => {
+    const m: Index<Edge> = new Map()
+    const A = axis === 'x' ? RX : RY
+    for (const e of edgesOf(S))
+      for (let i = Math.min(A(e[0]), A(e[1])); i <= Math.max(A(e[0]), A(e[1])); i++) push(m, i, e)
+    return m
+  })
+/** 现在的链接视图（linkView） */
+const viewOf = (S: State) =>
+  memo(S, 'view', () => linkView(S.get, (b) => predsOf(S).get(b.index) ?? []))
+/** 按块（4 格）分好的建筑：[非带子, 带子] */
+const blocksOf = (S: State) =>
+  memo(S, 'blocks', () => {
+    const m: [Index, Index] = [new Map(), new Map()]
+    for (const b of S.live)
+      push(m[isBelt(b) ? 1 : 0], K(Math.floor(P(b).x / 4), Math.floor(P(b).y / 4)), b)
+    return m
+  })
+/**
+ * 块里离 (x, y) 够得着（r 米以内，换成格：东西向按窄了的格宽，再留 0.01 格）、两个方向都在 7 格以内、f 认的有没有。
+ * r 取这一座和对面那类里最远的加起来，比它远的撞不上
+ */
+const span = (r: number): Pair => [
+  Math.min(7, r / (CELL_M * EW) + 0.01),
+  Math.min(7, r / CELL_M + 0.01),
+]
+function near(m: Index, x: number, y: number, r: number, f: (b: Building) => boolean) {
+  const [rx, ry] = span(r)
+  for (let bx = Math.floor((x - rx) / 4); bx <= Math.floor((x + rx) / 4); bx++) {
+    for (let by = Math.floor((y - ry) / 4); by <= Math.floor((y + ry) / 4); by++) {
+      for (const b of m.get(K(bx, by)) ?? [])
+        if (Math.abs(x - P(b).x) <= rx && Math.abs(y - P(b).y) <= ry && f(b)) return true
+    }
+  }
+  return false
+}
+/** 查设备时的半径：这一座够得着的 + 最大的物流站（电塔之间 3.5 m）；查带子时：这一座 + 带子的球和胶囊 */
+const toSolid = (b: Building) =>
+  Math.max(reachOf(b) + REACH[ST]!, b.itemId === TESLA ? Math.sqrt(TESLA_GAP2) : 0)
+const toBelt = (b: Building) => reachOf(b) + BELT_REACH
+function bbox(S: State) {
+  let x0 = Infinity,
+    y0 = Infinity,
+    x1 = -Infinity,
+    y1 = -Infinity
+  for (const b of S.live) {
+    const h = half(b)
+    x0 = Math.min(x0, RX(b) - h)
+    y0 = Math.min(y0, RY(b) - h)
+    x1 = Math.max(x1, RX(b) + h)
+    y1 = Math.max(y1, RY(b) + h)
+  }
+  return { x0, y0, x1, y1, w: x1 - x0 + 1, h: y1 - y0 + 1 }
+}
+const stationOf = (S: State) => S.live.find((b) => b.itemId === ST)!
+/** 同一格上两座建筑冲突吗：地面对地面冲突；高架带和非带子冲突；两条高架同高冲突；高架压地面带不冲突 */
+function cellClash(a: Building, b: Building) {
+  const ea = elev(a),
+    eb = elev(b)
+  if (!ea && !eb) return true
+  if (ea && eb) return Math.abs(P(a).z - P(b).z) < 0.25
+  return !isBelt(ea ? b : a)
+}
+
+const ON = 1,
+  MOV = 2,
+  GONE = 4 // shift 里给建筑打的记号：在线上、挪动、删掉
+/** 剪切那一段：碰到、整个在里面 */
+const spanOf = (axis: Axis, range: Pair | null) => {
+  const O = axis === 'x' ? RY : RX // 另一根轴
+  return {
+    touches: (b: Building) => !range || (O(b) + half(b) >= range[0] && O(b) - half(b) <= range[1]),
+    inside: (b: Building) => !range || (O(b) - half(b) >= range[0] && O(b) + half(b) <= range[1]),
+  }
+}
+/**
+ * 删一条线，前一半（和往哪边挪无关）：axis 'y' 删第 c 行（带子要竖直直通）、'x' 删第 c 列（带子要水平直通）；
+ * range [lo, hi]：只删另一根轴上这一段。线上不对就给 null，对就给线上的带子（连前后两节）和电塔，交给 shift
+ */
+function lineAt(S: State, axis: Axis, c: number, range: Pair | null = null): Line | null {
+  const X = axis === 'x'
+  const A = X ? RX : RY // 删线方向上的坐标
+  const O = X ? RY : RX
+  const { touches, inside } = spanOf(axis, range)
+  // 线上只许有带子和电塔（跨在剪切那一段边上的也不行）
+  const onLine = []
+  for (const b of linesOf(S, axis).get(c) ?? []) {
+    if (!touches(b)) continue
+    if (!inside(b) || (!isBelt(b) && b.itemId !== TESLA)) return null
+    onLine.push(b)
+  }
+  const cells = cellsOf(S)
+  const at = (x: number, y: number) => cells.get(K(x, y)) ?? []
+  // 线上的带子：前一节正好一节、没有设备往里送、后一节在线另一边同一根轴上，同高；前后两格都是设备的不删（设备之间至少留一节带子）
+  const preds = predsOf(S)
+  const links: Line['links'] = [],
+    teslas: Building[] = []
+  for (const b of onLine) {
+    if (b.itemId === TESLA) {
+      teslas.push(b)
+      continue
+    }
+    const pr = preds.get(b.index) ?? []
+    const n = S.get(b.outputObjIdx)
+    if (pr.length !== 1 || S.get(b.inputObjIdx) || !n) return null
+    const a = pr[0]
+    if (O(a) !== O(b) || O(n) !== O(b) || Math.abs(A(a) - c) !== 1 || A(a) + A(n) !== 2 * c)
+      return null
+    // 同一高度：删列时差 0.1 以内算一层（站口出来那几节带子高 0.01~0.02，和地面算一层），删行按 0.01
+    if ([a, n].some((q) => isBelt(q) && Math.abs(P(q).z - P(b).z) > (X ? 0.1 : 0.01))) return null
+    const prev = X ? at(c - 1, RY(b)) : at(RX(b), c - 1)
+    const next = X ? at(c + 1, RY(b)) : at(RX(b), c + 1)
+    if (prev.some(device) && next.some(device)) return null
+    links.push([b, a, n])
+  }
+  return { axis, c, range, onLine, links, teslas }
+}
+/**
+ * 删一条线，后一半：line（lineAt 给的）那条线删掉，side 那一侧（+1 = 坐标大于 c 的那侧朝 −1 挪，−1 = 小于 c 的那侧朝 +1 挪；
+ * 剪切时只是那一段里的）整体朝线挪一格。挪不了给 null；挪得了给 { links, moving, apply }（apply() 才真改）
+ */
+function shift(S: State, { axis, c, range, onLine, links, teslas }: Line, side: number) {
+  const X = axis === 'x'
+  const A = X ? RX : RY
+  const { touches, inside } = spanOf(axis, range)
+  const cells = cellsOf(S)
+  const at = (x: number, y: number) => cells.get(K(x, y)) ?? []
+  // 线上的电塔留在原地：挪过来压到它的那一格得全空（连高架也不能有）
+  for (const t of teslas) if ((X ? at(c + side, RY(t)) : at(RX(t), c + side)).length) return null
+  const mark = new Uint8Array(S.all.length)
+  for (const b of onLine) mark[b.index] |= ON
+  for (const [b] of links) mark[b.index] |= GONE
+  const moving: Building[] = []
+  for (const b of S.live) {
+    if (mark[b.index] & ON || side * (A(b) - c) <= 0 || !touches(b)) continue
+    if (!inside(b)) return null // 跨在剪切那一段的边上
+    mark[b.index] |= MOV
+    moving.push(b)
+  }
+  // 挪动部分和不挪部分之间的链接只能经过线上删掉的带子（整条线删时两头在线同一边的都一起挪或都不挪，只看跨过线的）
+  const through = new Set<number>()
+  for (const [b, a, n] of links)
+    through.add(a.index * 65536 + b.index).add(b.index * 65536 + n.index)
+  for (const [u, v] of range ? edgesOf(S) : (edgesAt(S, axis).get(c) ?? [])) {
+    if (through.has(u.index * 65536 + v.index)) continue
+    if ((mark[u.index] | mark[v.index]) & ON) {
+      if (u.itemId === TESLA || v.itemId === TESLA) continue
+      return null
+    }
+    if ((mark[u.index] & MOV) !== (mark[v.index] & MOV)) return null
+  }
+  const d = -side // 挪动方向
+  const dx = X ? d : 0,
+    dy = X ? 0 : d
+  const stays = (o: Building) => !(mark[o.index] & (MOV | GONE))
+  // 挪完的重叠：挪动的和不挪的挪完同格、挪之前不同格，就不能冲突（不挪的都占在线那头，只有紧挨着线的那一排够得着）
+  for (const m of moving) {
+    const h = half(m),
+      x = RX(m),
+      y = RY(m)
+    if (side * (A(m) - c) > h + 1) continue
+    let before = null
+    for (let ix = -h; ix <= h; ix++)
+      for (let iy = -h; iy <= h; iy++) {
+        for (const o of at(x + ix + dx, y + iy + dy)) {
+          if (!stays(o) || !cellClash(m, o)) continue
+          if (!before) {
+            before = new Set<Building>()
+            for (let jx = -h; jx <= h; jx++)
+              for (let jy = -h; jy <= h; jy++) for (const q of at(x + jx, y + jy)) before.add(q)
+          }
+          if (!before.has(o)) return null
+        }
+      }
+  }
+  // 建造盒：挪完撞、挪之前不撞的不行。挪完的链接：删掉的直通带子前一节直接接后一节（往后跳过删掉的，往前换成它的上一节），
+  // 挪动的位置加一格；带子的胶囊、放不放过都按挪完的链接算
+  const gone = (o: Building | null | undefined) => !!o && !!(mark[o.index] & GONE)
+  const preds0 = predsOf(S)
+  const predsAfter = (b: Building): Building[] =>
+    (preds0.get(b.index) ?? []).flatMap((q) => (gone(q) ? predsAfter(q) : [q]))
+  const viewBefore = viewOf(S)
+  const viewAfter = linkView(
+    (i) => {
+      let o = S.get(i)
+      while (o && gone(o)) o = S.get(o.outputObjIdx)
+      return o
+    },
+    predsAfter,
+    (b) => (mark[b.index] & MOV ? { x: P(b).x + dx, y: P(b).y + dy, z: P(b).z } : P(b)),
+  )
+  const [solid, belts] = blocksOf(S)
+  // 整条线删：不挪的都在线那头（取整以后差不到半格），离线比够得着的还远的挪动建筑撞不上；近的先查（撞了早停）
+  const off = (a: Building) => side * ((X ? P(a).x + dx : P(a).y + dy) - c)
+  const check = range
+    ? moving
+    : moving
+        .filter((a) => off(a) <= 0.5 + span(toSolid(a))[X ? 0 : 1])
+        .sort((a, b) => off(a) - off(b))
+  for (const a of check) {
+    const p0 = P(a),
+      pa = viewAfter.pos(a)
+    const hit = (b: Building) =>
+      stays(b) && collide(a, pa, b, P(b), viewAfter) && !collide(a, p0, b, P(b), viewBefore)
+    if (
+      near(solid, pa.x, pa.y, toSolid(a), hit) ||
+      (!isBelt(a) && near(belts, pa.x, pa.y, toBelt(a), hit))
+    )
+      return null
+  }
+  // 不挪的带子里，紧挨着删掉那节的（它的上一节、下一节换了）：胶囊、放不放过可能变，和不挪的设备再查一遍
+  for (const [, a, n] of links) {
+    for (const q of [a, n]) {
+      if (!isBelt(q) || !stays(q)) continue
+      const hit = (b: Building) =>
+        stays(b) && collide(q, P(q), b, P(b), viewAfter) && !collide(q, P(q), b, P(b), viewBefore)
+      if (near(solid, P(q).x, P(q).y, toSolid(q), hit)) return null
+    }
+  }
+  // 剪切：一段挪了、别的没挪，供电覆盖和电塔连通得重新看
+  if (range) {
+    const reach = powerReach('tesla')
+    const pos = (b: Building): Pair =>
+      mark[b.index] & MOV ? [P(b).x + dx, P(b).y + dy] : [P(b).x, P(b).y]
+    const keep = S.live.filter((b) => !(mark[b.index] & GONE))
+    const T = keep.filter((b) => b.itemId === TESLA).map(pos)
+    const d2 = (p: Pair, q: Pair) => (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2
+    for (const b of keep)
+      if (POWERED.includes(b.itemId)) {
+        const q = pos(b)
+        if (!T.some((t) => d2(t, q) <= reach.cover ** 2)) return null
+      }
+    if (T.length > 1) {
+      const seen = new Set([0]),
+        st = [0]
+      while (st.length) {
+        const i = st.pop()!
+        T.forEach((t, j) => {
+          if (!seen.has(j) && d2(T[i], t) <= reach.link ** 2) {
+            seen.add(j)
+            st.push(j)
+          }
+        })
+      }
+      if (seen.size < T.length) return null
+    }
+  }
+  return {
+    links: links.length,
+    moving: moving.length,
+    apply() {
+      for (const [b, a, n] of links) {
+        a.outputObjIdx = n.index // 带子接带子只记在上游那节
+        a.outputToSlot = b.outputToSlot
+        S.removed.add(b.index)
+      }
+      for (const b of moving)
+        for (const o of b.localOffset) {
+          o.x += dx
+          o.y += dy
+        }
+      refresh(S)
+    },
+  }
+}
+function tryLine(S: State, axis: Axis, c: number, side: number, range: Pair | null = null) {
+  const line = lineAt(S, axis, c, range)
+  return line && shift(S, line, side)
+}
+
+/** 删列：从左往右找能删的列，左边那侧朝站（右）挪，最左一列就挪右边；删到没有为止 */
+function colPass(S: State) {
+  for (let guard = 0; guard < 200; guard++) {
+    const bb = bbox(S)
+    let res = null
+    for (let c = bb.x0; c <= bb.x1 && !res; c++) {
+      const line = lineAt(S, 'x', c)
+      if (line)
+        for (const side of [-1, 1]) {
+          const r = shift(S, line, side)
+          if (r && r.moving > 0) {
+            res = r
+            break
+          }
+        }
+    }
+    if (!res) break
+    res.apply()
+  }
+}
+
+/** 删行（站那几行以外）：从外往里找，外侧朝站挪；删到没有为止 */
+function rowPass(S: State) {
+  for (let guard = 0; guard < 400; guard++) {
+    const bb = bbox(S)
+    const sy = RY(stationOf(S))
+    let res = null
+    for (const [from, to, side] of [
+      [bb.y1, sy + 4, 1],
+      [bb.y0, sy - 4, -1],
+    ] as const) {
+      for (let c = from; side > 0 ? c >= to : c <= to; c -= side) {
+        const r = tryLine(S, 'y', c, side)
+        if (r && r.moving > 0) {
+          res = r
+          break
+        }
+      }
+      if (res) break
+    }
+    if (!res) break
+    res.apply()
+  }
+}
+
+/**
+ * 站往循环那边剪切（只有一半有循环时）：以站左沿为界分成循环块和站块（站和它右边），谁在站外侧那头伸得更远，
+ * 就在谁那一块里删一行（只删这一块的列），把它外侧那几行朝循环挪一格；一样远先收循环块，伸得远的那块挪不动就停
+ */
+function stationShear(S: State) {
+  const st = stationOf(S)
+  const sy = RY(st),
+    k = RX(st) - 3
+  const up = S.live.some((b) => b.itemId === FRAC && RY(b) > sy),
+    dn = S.live.some((b) => b.itemId === FRAC && RY(b) < sy)
+  if (up && dn) return
+  const s = up ? -1 : 1 // 站外侧在哪头：上半边的阵列是 y 小的那头
+  for (let guard = 0; guard < 100; guard++) {
+    const bb = bbox(S)
+    const ranges: [Pair, Pair] = [
+      [bb.x0, k - 1],
+      [k, bb.x1],
+    ]
+    // 每块在站外侧那头的外沿（按中心在这一段里的建筑）
+    const edges = ranges.map(([lo, hi]) => {
+      const ys = S.live.filter((b) => RX(b) >= lo && RX(b) <= hi).map((b) => RY(b) + s * half(b))
+      return s < 0 ? Math.min(...ys) : Math.max(...ys)
+    })
+    const out = (i: number) => s * (edges[i] - edges[1 - i]) // > 0：第 i 块伸得更远
+    const i = out(0) > 0 ? 0 : out(1) > 0 ? 1 : 0
+    let res = null
+    for (let c = edges[i] - s; s < 0 ? c <= bb.y1 : c >= bb.y0; c -= s) {
+      const r = tryLine(S, 'y', c, s, ranges[i])
+      if (r && r.moving > 0) {
+        res = r
+        break
+      }
+    }
+    if (!res) break
+    res.apply()
+  }
+}
+
+const reachT = () => powerReach('tesla')
+const d2p = (a: Building, b: Building) => (P(a).x - P(b).x) ** 2 + (P(a).y - P(b).y) ** 2
+function connected(T: Building[], link: number) {
+  if (T.length <= 1) return true
+  const seen = new Set([T[0]]),
+    st = [T[0]]
+  while (st.length) {
+    const a = st.pop()!
+    for (const b of T)
+      if (!seen.has(b) && d2p(a, b) <= link ** 2) {
+        seen.add(b)
+        st.push(b)
+      }
+  }
+  return seen.size === T.length
+}
+/** 删多余的电塔（覆盖、连通都还在就删），按 order 给的先后试 */
+function pruneTeslas(S: State, order = (T: Building[]) => T) {
+  const { cover, link } = reachT()
+  const need = S.live.filter((b) => POWERED.includes(b.itemId))
+  let T = S.live.filter((b) => b.itemId === TESLA)
+  for (const t of order(T)) {
+    const rest = T.filter((u) => u !== t)
+    if (need.every((n) => rest.some((u) => d2p(u, n) <= cover ** 2)) && connected(rest, link)) {
+      T = rest
+      S.removed.add(t.index)
+    }
+  }
+  refresh(S)
+}
+/** 删多余电塔：先试压着包围盒边的，再试离用电建筑重心远的 */
+function prune(S: State) {
+  const bb = bbox(S)
+  const need = S.live.filter((b) => POWERED.includes(b.itemId))
+  const cx = need.reduce((a, b) => a + P(b).x, 0) / need.length,
+    cy = need.reduce((a, b) => a + P(b).y, 0) / need.length
+  const onEdge = (t: Building) =>
+    RX(t) === bb.x0 || RX(t) === bb.x1 || RY(t) === bb.y0 || RY(t) === bb.y1
+  const far = (t: Building) => (P(t).x - cx) ** 2 + (P(t).y - cy) ** 2
+  pruneTeslas(S, (T) =>
+    [...T].sort((a, b) => Number(onEdge(b)) - Number(onEdge(a)) || far(b) - far(a)),
+  )
+}
+
+/**
+ * 电塔重放：全部拿掉，在「本来就删不掉的列 × 本来就删不掉的行」里的空格（头顶也没有高架、放下去不撞）上贪心重放：
+ * 每次挑新覆盖最多的，同分挑离还没覆盖的重心近的；这样的格子盖不到了就退回任意不撞的空格（包围盒外 2 格以内也算）。
+ * 再补连通的中继、删多余。放不下就把原来的电塔放回去、给 false
+ */
+function relocate(S: State) {
+  const { cover, link } = reachT()
+  const old = S.live.filter((b) => b.itemId === TESLA)
+  if (!old.length) return false
+  const tpl = structuredClone(old[0])
+  for (const t of old) S.removed.add(t.index)
+  refresh(S)
+  const undo = () => {
+    for (const t of old) S.removed.delete(t.index)
+    refresh(S)
+    return false
+  }
+  const bb = bbox(S)
+  const sy = RY(stationOf(S))
+  const freeCol = new Set<number>(),
+    freeRow = new Set<number>()
+  for (let c = bb.x0; c <= bb.x1; c++) {
+    const line = lineAt(S, 'x', c)
+    if (line && [-1, 1].some((side) => shift(S, line, side))) freeCol.add(c)
+  }
+  for (let c = bb.y0; c <= bb.y1; c++)
+    if (Math.abs(c - sy) > 3 && tryLine(S, 'y', c, c > sy ? 1 : -1)) freeRow.add(c)
+  const L = S.live
+  const need = L.filter((b) => POWERED.includes(b.itemId))
+  const cells = cellsOf(S)
+  const fake: Building = { ...tpl, yaw: [0, 0], index: -1 }
+  const [solid, belts] = blocksOf(S)
+  const view = viewOf(S) // 新电塔不接任何东西，带子对它一律不放过
+  const empty: TeslaSite[] = []
+  for (let x = bb.x0 - 2; x <= bb.x1 + 2; x++)
+    for (let y = bb.y0 - 2; y <= bb.y1 + 2; y++) {
+      const hit = (b: Building) => collide(fake, { x, y, z: 0 }, b, P(b), view)
+      if (
+        cells.has(K(x, y)) ||
+        near(solid, x, y, toSolid(fake), hit) ||
+        near(belts, x, y, toBelt(fake), hit)
+      )
+        continue
+      empty.push({ x, y, out: x < bb.x0 || x > bb.x1 || y < bb.y0 || y > bb.y1 })
+    }
+  const cand = empty.filter((c) => !c.out && !freeCol.has(c.x) && !freeRow.has(c.y))
+  const d2 = (a: Point2, b: Point2) => (a.x - b.x) ** 2 + (a.y - b.y) ** 2
+  // 每个空格盖得到哪几座用电建筑（位置不变，用到才算）
+  const covOf = (c: TeslaSite) =>
+    c.cov ?? (c.cov = need.flatMap((n, i) => (d2(c, P(n)) <= cover ** 2 ? [i] : [])))
+  const placed: TeslaSite[] = []
+  const covered = need.map(() => false)
+  let left = need.length
+  // 离放好的电塔不到 3.5 m 的格子不能再放：每放一座标一次
+  const ok = (c: TeslaSite) => !c.near
+  const place = (p: TeslaSite) => {
+    placed.push(p)
+    for (const c of empty)
+      if (!c.near && (((p.x - c.x) * EW) ** 2 + (p.y - c.y) ** 2) * CELL_M ** 2 < TESLA_GAP2)
+        c.near = true
+  }
+  while (left > 0) {
+    let gx = 0,
+      gy = 0
+    need.forEach((n, i) => {
+      if (!covered[i]) {
+        gx += P(n).x
+        gy += P(n).y
+      }
+    })
+    gx /= left
+    gy /= left
+    const pool = cand.some((c) => ok(c) && covOf(c).some((i) => !covered[i])) ? cand : empty
+    let best = null,
+      bs = 0,
+      bd = Infinity
+    for (const c of pool) {
+      if (!ok(c)) continue
+      let k = 0
+      for (const i of covOf(c)) if (!covered[i]) k++
+      const dd = (c.x - gx) ** 2 + (c.y - gy) ** 2
+      if (k > bs || (k === bs && k > 0 && dd < bd)) {
+        bs = k
+        best = c
+        bd = dd
+      }
+    }
+    if (!best) return undo()
+    place(best)
+    for (const i of covOf(best))
+      if (!covered[i]) {
+        covered[i] = true
+        left--
+      }
+  }
+  // 连通：两群之间补中继（先在候选格里挑，挑不到退回任意空格）
+  const comps = () => {
+    const out: TeslaSite[][] = [],
+      seen = new Set<TeslaSite>()
+    for (const p of placed) {
+      if (seen.has(p)) continue
+      const g = [p]
+      seen.add(p)
+      for (let i = 0; i < g.length; i++)
+        for (const q of placed)
+          if (!seen.has(q) && d2(g[i], q) <= link ** 2) {
+            seen.add(q)
+            g.push(q)
+          }
+      out.push(g)
+    }
+    return out
+  }
+  for (let g = 0; g < 20; g++) {
+    const cs = comps()
+    if (cs.length <= 1) break
+    const [a, ...rest] = cs
+    const b = rest.flat()
+    const pick = (list: TeslaSite[]) =>
+      list.find(
+        (c) => ok(c) && a.some((p) => d2(p, c) <= link ** 2) && b.some((p) => d2(p, c) <= link ** 2),
+      )
+    const c = pick(cand) ?? pick(empty)
+    if (!c) return undo()
+    place(c)
+  }
+  if (comps().length > 1) return undo()
+  for (const p of placed) {
+    const t = structuredClone(tpl)
+    t.index = S.all.length
+    for (const o of t.localOffset) {
+      o.x = p.x
+      o.y = p.y
+      o.z = 0
+    }
+    S.all.push(t)
+    S.tags.set(t.index, 'T')
+  }
+  refresh(S)
+  pruneTeslas(S)
+  return true
+}
+
+/** 存一份能改的东西（位置、带子往哪接、删了哪些、all 多长），试完不划算再放回去 */
+function save(S: State) {
+  return {
+    n: S.all.length,
+    removed: [...S.removed],
+    b: S.all.map((b): [Pair[], number, number] => [
+      b.localOffset.map((o) => [o.x, o.y]),
+      b.outputObjIdx,
+      b.outputToSlot,
+    ]),
+  }
+}
+function restore(S: State, s: ReturnType<typeof save>) {
+  for (let i = s.n; i < S.all.length; i++) S.tags.delete(i)
+  S.all.length = s.n
+  S.removed.clear()
+  for (const i of s.removed) S.removed.add(i)
+  s.b.forEach(([offs, out, slot], i) => {
+    const b = S.all[i]
+    offs.forEach(([x, y], k) => {
+      b.localOffset[k].x = x
+      b.localOffset[k].y = y
+    })
+    b.outputObjIdx = out
+    b.outputToSlot = slot
+  })
+  refresh(S)
+}
+
+/** 压紧：all 里没在 removed 的就是留着的；直接改位置、链接、removed，新电塔追加到 all、标签记进 tags */
+export function compact(all: Building[], removed: Set<number>, tags: Map<number, string>) {
+  const S: State = {
+    live: [],
+    memo: {},
+    all,
+    removed,
+    tags,
+    get: (i) => (i >= 0 && !removed.has(i) ? all[i] : null),
+  }
+  refresh(S)
+  rowPass(S)
+  prune(S)
+  rowPass(S)
+  stationShear(S)
+  colPass(S)
+  const snap = save(S)
+  const b0 = bbox(S)
+  if (relocate(S)) {
+    colPass(S)
+    rowPass(S)
+  }
+  const b1 = bbox(S)
+  if (b1.w * b1.h >= b0.w * b0.h || b1.w > b0.w || b1.h > b0.h) restore(S, snap)
+}

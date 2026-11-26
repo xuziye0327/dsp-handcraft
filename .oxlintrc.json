@@ -1,5 +1,12 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "ignorePatterns": [
+    "dist/**",
+    ".agent-temp/**",
+    "web/calc/dsq-data.js",
+    "web/calc/calc-icons.js",
+    "src/beltless/dsq.js"
+  ],
   "plugins": ["react", "typescript", "oxc", "jsx-a11y"],
   "categories": {
     "correctness": "error"
